@@ -1,0 +1,14 @@
+{
+  "name": "@deployx/router",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Wildcard subdomain request router serving build output from object storage",
+  "scripts": {
+    "dev": "tsx watch --clear-screen=false src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@deployx/shared": "*"
+  }
+}

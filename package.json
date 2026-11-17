@@ -1,0 +1,39 @@
+{
+  "name": "deployx",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first auto-deployment platform: clone, build and serve Git repositories on wildcard subdomains.",
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n api,worker,router,web -c cyan,magenta,yellow,green \"npm:dev:api\" \"npm:dev:worker\" \"npm:dev:router\" \"npm:dev:web\"",
+    "dev:api": "npm run dev -w @deployx/api",
+    "dev:worker": "npm run dev -w @deployx/worker",
+    "dev:router": "npm run dev -w @deployx/router",
+    "dev:web": "npm run dev -w @deployx/dashboard",
+    "start": "concurrently -k -n api,worker,router,web -c cyan,magenta,yellow,green \"npm start -w @deployx/api\" \"npm start -w @deployx/worker\" \"npm start -w @deployx/router\" \"npm start -w @deployx/dashboard\"",
+    "build": "npm run build -w @deployx/dashboard",
+    "typecheck": "tsc -p tsconfig.json --noEmit && npm run typecheck -w @deployx/dashboard",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "db:generate": "prisma generate --schema packages/shared/prisma/schema.prisma",
+    "db:migrate": "prisma migrate dev --schema packages/shared/prisma/schema.prisma",
+    "db:deploy": "prisma migrate deploy --schema packages/shared/prisma/schema.prisma",
+    "db:studio": "prisma studio --schema packages/shared/prisma/schema.prisma",
+    "postinstall": "prisma generate --schema packages/shared/prisma/schema.prisma"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "concurrently": "^9.1.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "prisma": "^6.19.3"
+  },
+  "engines": {
+    "node": ">=20.12"
+  }
+}
