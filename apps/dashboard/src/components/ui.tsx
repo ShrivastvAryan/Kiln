@@ -124,10 +124,22 @@ export const STATUS_META: Record<DeploymentStatus, { label: string; tone: string
   uploading: { label: 'Uploading', tone: 'text-info bg-info-soft', dot: 'bg-info', active: true },
   ready: { label: 'Ready', tone: 'text-success bg-success-soft', dot: 'bg-success', active: false },
   failed: { label: 'Failed', tone: 'text-danger bg-danger-soft', dot: 'bg-danger', active: false },
+  cancelled: { label: 'Stopped', tone: 'text-muted bg-elevated', dot: 'bg-subtle', active: false },
 };
 
-export function StatusDot({ status, className }: { status: DeploymentStatus; className?: string }) {
-  const meta = STATUS_META[status];
+const PAUSED_META = { label: 'Paused', tone: 'text-warning bg-warning-soft', dot: 'bg-warning', active: false };
+
+export function StatusDot({
+  status,
+  paused,
+  className,
+}: {
+  status: DeploymentStatus;
+  /** A ready deployment that is paused shows as "Paused". */
+  paused?: boolean;
+  className?: string;
+}) {
+  const meta = paused && status === 'ready' ? PAUSED_META : STATUS_META[status];
   return (
     <span className={cn('relative inline-flex size-2 shrink-0', className)}>
       {meta.active && <span className={cn('absolute inset-0 animate-ping rounded-full opacity-60', meta.dot)} />}
@@ -136,13 +148,13 @@ export function StatusDot({ status, className }: { status: DeploymentStatus; cla
   );
 }
 
-export function StatusBadge({ status }: { status: DeploymentStatus }) {
-  const meta = STATUS_META[status];
+export function StatusBadge({ status, paused }: { status: DeploymentStatus; paused?: boolean }) {
+  const meta = paused && status === 'ready' ? PAUSED_META : STATUS_META[status];
   return (
     <span
       className={cn('inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium', meta.tone)}
     >
-      <StatusDot status={status} />
+      <StatusDot status={status} paused={paused} />
       {meta.label}
     </span>
   );

@@ -1,5 +1,5 @@
 import type { Request, Response } from 'express';
-import { createRedis, keys } from '@deployx/shared';
+import { createRedis, keys, type PlatformEvent } from '@deployx/shared';
 
 /**
  * Server-Sent Events hub. A single Redis subscriber connection fans messages out to all
@@ -7,7 +7,8 @@ import { createRedis, keys } from '@deployx/shared';
  */
 export class RealtimeHub {
   private sub = createRedis('api-sub');
-  private eventClients = new Set<Response>();
+  /** Event stream subscribers → the user each one belongs to. */
+  private eventClients = new Map<Response, string>();
   private logClients = new Map<string, Set<Response>>();
 
   async start() {
@@ -19,7 +20,15 @@ export class RealtimeHub {
     await this.sub.psubscribe(keys.logChannelPattern);
 
     this.sub.on('message', (_channel: string, message: string) => {
-      for (const res of this.eventClients) send(res, 'event', message);
+      let ownerId: string | undefined;
+      try {
+        const event = JSON.parse(message) as PlatformEvent;
+        ownerId = event.type === 'deployment.updated' ? event.deployment.ownerId : event.ownerId;
+      } catch {
+        return;
+      }
+      if (!ownerId) return; // ownerless (pre-auth) deployments are never broadcast
+      for (const [res, userId] of this.eventClients) if (userId === ownerId) send(res, 'event', message);
     });
     this.sub.on('pmessage', (_pattern: string, channel: string, message: string) => {
       const id = channel.slice(keys.logChannel('').length);
@@ -29,14 +38,14 @@ export class RealtimeHub {
 
     // Heartbeats keep proxies from closing idle connections.
     setInterval(() => {
-      for (const res of this.eventClients) res.write(': ping\n\n');
+      for (const res of this.eventClients.keys()) res.write(': ping\n\n');
       for (const set of this.logClients.values()) for (const res of set) res.write(': ping\n\n');
     }, 15_000).unref();
   }
 
-  addEventClient(req: Request, res: Response) {
+  addEventClient(req: Request, res: Response, userId: string) {
     open(res);
-    this.eventClients.add(res);
+    this.eventClients.set(res, userId);
     req.on('close', () => this.eventClients.delete(res));
   }
 

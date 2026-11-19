@@ -11,7 +11,7 @@ log line to the browser in real time, and serves the result on its own wildcard 
 │ (Next.js, SSE) │ ◄─── SSE: events, logs ── │ Express + SSE hub│                      ▼
 └────────────────┘                          └──────┬───────────┘           ┌───────────────────┐
         ▲                                          │ LPUSH id              │  Object storage   │
-        │                                          ▼                       │ (MinIO / S3 / fs) │
+        │                                          ▼                       │(SeaweedFS/S3/fs)  │
         │                                   ┌──────────────┐               │  source/<id>/…    │
         │        PUBLISH logs:<id>          │    Redis     │               │  dist/<id>/…      │
         └────────────────────────────────── │ queue·pubsub │               └─────────┬─────────┘
@@ -43,7 +43,7 @@ log line to the browser in real time, and serves the result on its own wildcard 
 - **Operator console:** live deployment list with search and filters, stats, a pipeline visualiser, a live site
   preview, a virtualised ANSI-colour log terminal (search, timestamps, wrap, copy, download, fullscreen), an
   infrastructure view with worker heartbeats, dark/light themes, keyboard shortcuts and a responsive layout.
-- **Pluggable storage:** an S3 driver (MinIO, AWS S3, Cloudflare R2) or a local-disk driver with the same key layout.
+- **Pluggable storage:** an S3 driver (SeaweedFS, AWS S3, Cloudflare R2) or a local-disk driver with the same key layout.
 
 ## Tech stack
 
@@ -51,7 +51,7 @@ log line to the browser in real time, and serves the result on its own wildcard 
 | ---------- | ---------------------------------------------------------------------------------- |
 | Frontend   | Next.js 15 (App Router), React 19, TypeScript, Tailwind CSS v4, react-virtuoso, Lucide |
 | Backend    | Node.js 22, TypeScript, Express, simple-git, ioredis, AWS SDK v3                    |
-| Data       | PostgreSQL + Prisma (source of truth), Redis (queue, pub/sub, live state), MinIO/S3 |
+| Data       | PostgreSQL + Prisma (source of truth), Redis (queue, pub/sub, live state), SeaweedFS/S3 |
 | Infra      | Docker, Docker Compose; Neon for hosted Postgres                                   |
 | Monorepo   | npm workspaces: `apps/dashboard`, `services/{api,worker,router}`, `packages/shared`|
 
@@ -59,7 +59,7 @@ log line to the browser in real time, and serves the result on its own wildcard 
 
 ```
 apps/dashboard/         Next.js console
-  src/app/              App Router routes: /, /new, /deployments/[id], /system
+  src/app/              App Router routes: /, /new, /deployments/[id]
   src/views/            client views for each route
   src/components/       layout shell, log console, pipeline, UI primitives
   src/hooks/            SSE-backed deployments store, log stream, health
@@ -71,32 +71,50 @@ packages/shared/        types, config, Redis helpers, storage drivers (S3 / fs)
 
 ## Getting started
 
-**Requirements:** Node.js 20.12+, plus Docker for the recommended setup.
+**Requirements:** Docker, plus Node.js 20.12+ (or Bun) for the console.
 
 ```bash
-npm install
-cp .env.example .env
-npm run infra:up      # PostgreSQL + Redis + MinIO via docker compose
-npm run db:migrate    # create the tables (Prisma migrations)
-npm run dev           # Next.js console :3000 · api :8000 · router :3001 · worker
+npm install                 # or: bun install
+cp .env.example .env        # set S3_SECRET_KEY (openssl rand -hex 24)
+npx neon login              # once; then pull the Neon connection strings into .env:
+npx neon env pull
+npm run services:up         # docker compose: Redis, SeaweedFS, migrations (to Neon), API, worker, router
+bun dev                     # the Next.js console on :3000 (npm run dev works too)
 ```
+
+| Command | What it does |
+| ------- | ------------ |
+| `npm run services:up` | Builds the service image and starts everything in Docker (`docker compose up -d --build`) |
+| `npm run services:logs` | Follows API, worker and router logs |
+| `npm run services:rebuild` | Rebuilds and restarts the three services after code changes |
+| `npm run services:down` | Stops the stack (data is kept in Docker volumes) |
+| `bun dev` / `npm run dev` | Console only, with hot reload |
+| `npm run dev:all` | Runs every service on the host instead (needs `npm run infra:up` and a `.env`) |
+
+Secrets (Neon connection strings, S3 keys) are read from `.env`, which git ignores. `docker-compose.yml` only
+references them as `${...}` and refuses to start if one is missing. SeaweedFS enforces the S3 keys.
+
+In Docker the worker builds each repo in a sibling container through the host's Docker socket, so
+untrusted install and build scripts never run in the service containers or on your machine.
 
 Open **http://localhost:3000**, click an example repo and press **Deploy**.
 `*.localhost` resolves to 127.0.0.1 in all modern browsers, so wildcard subdomains need no DNS setup.
-The MinIO console is at http://localhost:9001 (`deployx` / `deployx-secret`).
+Object storage is SeaweedFS (S3 API on :8333, cluster status on http://localhost:9333). Any S3-compatible store
+(AWS S3, Cloudflare R2) can replace it by changing `S3_ENDPOINT` and the keys.
 
-### Using Neon (hosted PostgreSQL)
+### Database: Neon
 
-1. Create a project at [neon.tech](https://neon.tech) (free tier).
-2. In **Connection details**, copy two connection strings into `.env`:
-   ```
-   DATABASE_URL=postgresql://…@ep-xxx-pooler.region.aws.neon.tech/neondb?sslmode=require   # pooled
-   DIRECT_URL=postgresql://…@ep-xxx.region.aws.neon.tech/neondb?sslmode=require            # direct
-   ```
-   The app uses the pooled URL; migrations need the direct one.
-3. Run `npm run db:deploy` to apply the migrations, then `npm run dev`.
+Postgres is [Neon](https://neon.tech) (project linked in `neon.ts` / `.neon`). `neon env pull` writes two
+connection strings into `.env`:
 
-Browse the data with `npm run db:studio`.
+- `DATABASE_URL`: **pooled** (`-pooler` host), used by the services for queries.
+- `DATABASE_URL_UNPOOLED`: **direct**, used by Prisma Migrate (`directUrl`); migrations fail through PgBouncer.
+
+The `migrate` container applies pending migrations to Neon on every `services:up`. Browse data with
+`npm run db:studio`.
+
+> If your router's DNS can't resolve Neon hostnames (`P1001: Can't reach database server`), switch your
+> machine's DNS to 1.1.1.1 / 8.8.8.8. The Docker services already use public DNS and prefer IPv4.
 
 ### Running without Docker
 
@@ -125,10 +143,30 @@ projects ──< deployments ──< build_logs
 
 The schema is in [`packages/shared/prisma/schema.prisma`](packages/shared/prisma/schema.prisma).
 
+## Authentication
+
+Self-built JWT auth in the API (`services/api/src/auth/`), with users and sessions stored in Neon.
+
+| Piece | How it works |
+| ----- | ------------ |
+| Access token | HS256 JWT, 15 minutes, kept **only in browser memory** and sent as `Authorization: Bearer` |
+| Refresh token | 256-bit random value in an `HttpOnly; SameSite=Strict; Path=/api/auth` cookie; only its SHA-256 hash is stored |
+| Rotation | Every refresh issues a new refresh token; replaying a rotated one revokes the whole sign-in (token family) |
+| Passwords | Argon2id; constant-time "unknown email" path; Redis rate limits on login and sign-up |
+| Google | OAuth 2.0 Authorization Code + PKCE + `state`, ID token verified against Google's keys, verified emails only |
+| Ownership | Every deployment and project has an owner; all routes, stats and live streams are scoped to the signed-in user |
+| CORS / CSRF | Credentials allowed only for the console origin; cookie endpoints require `X-Requested-With: kiln` |
+
+Google sign-in is optional: create a Web OAuth client with redirect URI
+`http://localhost:8000/api/auth/google/callback`, put `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` in `.env`, then
+`docker compose up -d api`. The button appears automatically.
+
 ## API
 
 | Method | Path                                   | Description                                    |
 | ------ | -------------------------------------- | ---------------------------------------------- |
+| POST   | `/api/auth/register` · `/login` · `/refresh` · `/logout` | Email + password auth; refresh/logout use the cookie |
+| GET    | `/api/auth/google` → `/google/callback`  | Google sign-in (PKCE) |
 | POST   | `/api/deployments`                     | `{ repoUrl, branch?, installCommand?, buildCommand?, outputDir? }` → 202 |
 | GET    | `/api/deployments`                     | List deployments (newest first)                |
 | GET    | `/api/deployments/:id`                 | Deployment details                             |

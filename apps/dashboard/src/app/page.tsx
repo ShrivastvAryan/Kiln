@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { Logo } from '@/components/Layout';
 import { ArchitectureFlow } from '@/components/ArchitectureFlow';
+import { HeaderAuthLinks } from '@/components/HeaderAuthLinks';
 import { HeroBackground } from '@/components/HeroBackground';
 import { HowItWorks } from '@/components/HowItWorks';
 import { StackShowcase } from '@/components/StackShowcase';
@@ -53,7 +54,7 @@ const FAQ = [
   },
   {
     q: 'Where are build artifacts stored?',
-    a: 'In S3-compatible object storage: MinIO locally, or AWS S3 / Cloudflare R2 by changing the endpoint. Source snapshots live under source/<id>/ and build output under dist/<id>/. A local-disk driver with the same layout works without Docker. Deployment records and build logs are kept in PostgreSQL.',
+    a: 'In S3-compatible object storage: SeaweedFS locally, or AWS S3 / Cloudflare R2 by changing the endpoint. Source snapshots live under source/<id>/ and build output under dist/<id>/. A local-disk driver with the same layout works without Docker. Deployment records and build logs are kept in PostgreSQL.',
   },
   {
     q: 'Is it safe to build repositories I don’t control?',
@@ -110,20 +111,17 @@ export default function HomePage() {
             <a href="#stack" className="hidden rounded-md px-3 py-2 text-muted hover:text-fg md:block">
               Stack
             </a>
-            <Link
-              href="/deployments"
-              className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-fg px-4 font-medium text-bg transition-opacity hover:opacity-90"
-            >
-              Open console <ArrowRight className="size-4" />
-            </Link>
+            <HeaderAuthLinks />
           </nav>
         </div>
       </header>
 
       <main>
         {/* Hero: always-dark stage with an animated ASCII sunrise (React Bits GradientASCII) */}
-        <section className="relative isolate overflow-hidden bg-neutral-950 text-neutral-100">
-          <HeroBackground className="absolute inset-0 -z-20" />
+        <section className="theme-dark relative isolate overflow-hidden bg-neutral-950 text-neutral-100">
+          <HeroBackground className="absolute inset-0 -z-30" />
+          {/* Grid lines (same as the auth pages), fading out from the top */}
+          <div className="bg-grid absolute inset-0 -z-20" aria-hidden="true" />
           {/* Scrim keeps the heading readable over the glow */}
           <div
             className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(ellipse_70%_55%_at_50%_30%,rgb(12_10_9/0.85),transparent_75%)]"

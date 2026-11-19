@@ -29,7 +29,7 @@ const STACK: Tech[] = [
   { symbol: 'Pg', name: 'PostgreSQL', role: 'Source of truth', category: 'data' },
   { symbol: 'Pr', name: 'Prisma', role: 'ORM + migrations', category: 'data' },
   { symbol: 'Rd', name: 'Redis', role: 'Queue + pub/sub', category: 'data' },
-  { symbol: 'S3', name: 'MinIO / S3', role: 'Object storage', category: 'data' },
+  { symbol: 'S3', name: 'SeaweedFS / S3', role: 'Object storage', category: 'data' },
   { symbol: 'Dk', name: 'Docker', role: 'Sandboxed builds', category: 'infra' },
   { symbol: 'Ne', name: 'Neon', role: 'Hosted Postgres', category: 'infra' },
 ];

@@ -1,10 +1,14 @@
+import cookieParser from 'cookie-parser';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import {
   ACTIVE_STATUSES,
   config,
   createDeployment,
   createRedis,
+  cancelDeployment,
   deleteDeployment,
+  setPaused,
+  syncAppAliases,
   deploymentUrl,
   getDeployment,
   getLogs,
@@ -17,8 +21,12 @@ import {
   type SystemHealth,
   type WorkerInfo,
 } from '@deployx/shared';
+import { authConfig } from './auth/config';
+import { requireAuth } from './auth/middleware';
+import { authRouter } from './auth/routes';
+import { githubPublicRouter, githubRouter } from './github/routes';
 import { RealtimeHub } from './realtime';
-import { cloneAndEnqueue } from './uploader';
+import { abortClone, cloneAndEnqueue } from './uploader';
 import { ValidationError, generateId, parseCreateInput } from './validation';
 
 const redis = createRedis('api');
@@ -26,15 +34,32 @@ const hub = new RealtimeHub();
 const app = express();
 
 app.disable('x-powered-by');
+app.set('trust proxy', 'loopback, linklocal, uniquelocal'); // real client IP for rate limits behind Docker/proxies
 app.use(express.json({ limit: '16kb' }));
-app.use((_req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
-  // The Next.js console runs on another origin, so answer CORS preflights directly.
-  if (_req.method === 'OPTIONS') return res.status(204).end();
+app.use(cookieParser());
+
+// CORS: only the Kiln console may call the API, with credentials (the refresh-token cookie).
+app.use((req, res, next) => {
+  const origin = req.get('origin');
+  res.setHeader('Vary', 'Origin');
+  if (origin && authConfig.dashboardOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Max-Age', '600');
+  }
+  if (req.method === 'OPTIONS') return res.status(204).end();
   next();
 });
+
+// Public: sign-up, sign-in, refresh, Google OAuth, and GitHub's redirects back to Kiln.
+app.use('/api/auth', authRouter(redis));
+app.use('/api/github', githubPublicRouter(redis));
+
+// Everything else requires a valid access token.
+app.use('/api', requireAuth);
+app.use('/api/github', githubRouter(redis));
 
 const wrap =
   (fn: (req: Request, res: Response) => Promise<unknown>) => (req: Request, res: Response, next: NextFunction) =>
@@ -42,9 +67,9 @@ const wrap =
 
 // ── Deployments ────────────────────────────────────────────────────────────────
 
-async function startDeployment(input: ReturnType<typeof parseCreateInput>) {
+async function startDeployment(ownerId: string, input: ReturnType<typeof parseCreateInput>) {
   const id = generateId();
-  const deployment = await createDeployment(redis, { id, ...input, url: deploymentUrl(id) });
+  const deployment = await createDeployment(redis, { id, ownerId, ...input, url: deploymentUrl(id) });
   void cloneAndEnqueue(redis, deployment); // fire-and-forget; progress is streamed via logs
   return deployment;
 }
@@ -53,21 +78,21 @@ app.post(
   '/api/deployments',
   wrap(async (req, res) => {
     const input = parseCreateInput(req.body);
-    res.status(202).json(await startDeployment(input));
+    res.status(202).json(await startDeployment(req.auth!.userId, input));
   }),
 );
 
 app.get(
   '/api/deployments',
-  wrap(async (_req, res) => {
-    res.json(await listDeployments());
+  wrap(async (req, res) => {
+    res.json(await listDeployments(req.auth!.userId));
   }),
 );
 
 app.get(
   '/api/deployments/:id',
   wrap(async (req, res) => {
-    const d = await getDeployment(req.params.id);
+    const d = await getDeployment(req.params.id, req.auth!.userId);
     if (!d) return res.status(404).json({ error: 'Deployment not found' });
     res.json(d);
   }),
@@ -76,17 +101,47 @@ app.get(
 app.post(
   '/api/deployments/:id/redeploy',
   wrap(async (req, res) => {
-    const d = await getDeployment(req.params.id);
+    const d = await getDeployment(req.params.id, req.auth!.userId);
     if (!d) return res.status(404).json({ error: 'Deployment not found' });
     const input = parseCreateInput(d);
-    res.status(202).json(await startDeployment(input));
+    res.status(202).json(await startDeployment(req.auth!.userId, input));
   }),
 );
+
+/** Stop an in-progress deployment (clone, queue, build or upload). */
+app.post(
+  '/api/deployments/:id/cancel',
+  wrap(async (req, res) => {
+    const d = await getDeployment(req.params.id, req.auth!.userId);
+    if (!d) return res.status(404).json({ error: 'Deployment not found' });
+    const cancelled = await cancelDeployment(redis, d.id);
+    if (!cancelled) return res.status(409).json({ error: 'This deployment has already finished' });
+    abortClone(d.id); // if it's still cloning in this process
+    res.json(cancelled);
+  }),
+);
+
+/** Pause / resume serving a ready deployment. */
+for (const [action, paused] of [
+  ['pause', true],
+  ['resume', false],
+] as const) {
+  app.post(
+    `/api/deployments/:id/${action}`,
+    wrap(async (req, res) => {
+      const d = await getDeployment(req.params.id, req.auth!.userId);
+      if (!d) return res.status(404).json({ error: 'Deployment not found' });
+      const updated = await setPaused(redis, d.id, paused);
+      if (!updated) return res.status(409).json({ error: 'Only a ready deployment can be paused or resumed' });
+      res.json(updated);
+    }),
+  );
+}
 
 app.delete(
   '/api/deployments/:id',
   wrap(async (req, res) => {
-    const d = await getDeployment(req.params.id);
+    const d = await getDeployment(req.params.id, req.auth!.userId);
     if (!d) return res.status(404).json({ error: 'Deployment not found' });
     if (ACTIVE_STATUSES.includes(d.status))
       return res.status(409).json({ error: 'Cannot delete a deployment while it is in progress' });
@@ -95,7 +150,7 @@ app.delete(
       storage.deletePrefix(storageKeys.source(d.id)),
       storage.deletePrefix(storageKeys.output(d.id)),
     ]);
-    await deleteDeployment(redis, d.id);
+    await deleteDeployment(redis, d.id, req.auth!.userId);
     res.status(204).end();
   }),
 );
@@ -103,18 +158,20 @@ app.delete(
 app.get(
   '/api/deployments/:id/logs',
   wrap(async (req, res) => {
+    if (!(await getDeployment(req.params.id, req.auth!.userId))) return res.status(404).json({ error: 'Deployment not found' });
     res.json(await getLogs(redis, req.params.id));
   }),
 );
 
 // ── Realtime (Server-Sent Events) ─────────────────────────────────────────────
 
-app.get('/api/events', (req, res) => hub.addEventClient(req, res));
+app.get('/api/events', (req, res) => hub.addEventClient(req, res, req.auth!.userId));
 
 app.get(
   '/api/deployments/:id/logs/stream',
   wrap(async (req, res) => {
     const id = req.params.id;
+    if (!(await getDeployment(id, req.auth!.userId))) return res.status(404).json({ error: 'Deployment not found' });
     await hub.addLogClient(req, res, id, () => getLogs(redis, id));
   }),
 );
@@ -123,8 +180,8 @@ app.get(
 
 app.get(
   '/api/stats',
-  wrap(async (_req, res) => {
-    res.json(await getStats(redis)); // aggregated in SQL (GROUP BY status, AVG duration)
+  wrap(async (req, res) => {
+    res.json(await getStats(redis, req.auth!.userId)); // aggregated in SQL (GROUP BY status, AVG duration)
   }),
 );
 
@@ -177,6 +234,10 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 await getStorage();
 await hub.start();
+// Older apps get their stable-URL slug, and every app URL is pointed at its latest live build.
+syncAppAliases(redis)
+  .then((n) => console.log(`[api] app URLs synced for ${n} app(s)`))
+  .catch((err) => console.error('[api] syncing app URLs failed', err));
 app.listen(config.apiPort, () => {
   console.log(`[api] listening on http://localhost:${config.apiPort} (storage: ${config.storage.driver})`);
 });

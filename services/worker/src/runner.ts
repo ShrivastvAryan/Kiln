@@ -10,6 +10,15 @@ export interface RunOptions {
   name: string;
   onLine: (stream: 'stdout' | 'stderr', line: string) => void;
   timeoutMs: number;
+  /** Aborting kills the command (the deployment was stopped by its owner). */
+  signal?: AbortSignal;
+}
+
+/** Thrown when a command is killed because the deployment was stopped. */
+export class CancelledError extends Error {
+  constructor() {
+    super('Deployment stopped by user');
+  }
 }
 
 /**
@@ -18,7 +27,8 @@ export interface RunOptions {
  * Output is split into lines and streamed to `onLine` as it arrives.
  */
 export function runCommand(opts: RunOptions): Promise<void> {
-  const { cwd, command, name, onLine, timeoutMs } = opts;
+  const { cwd, command, name, onLine, timeoutMs, signal } = opts;
+  if (signal?.aborted) return Promise.reject(new CancelledError());
   const docker = config.worker.isolation === 'docker';
   const { uid, gid } = os.userInfo();
 
@@ -75,27 +85,45 @@ export function runCommand(opts: RunOptions): Promise<void> {
 
   return new Promise((resolve, reject) => {
     let timedOut = false;
+    let cancelled = false;
+    const kill = () => {
+      if (docker) spawn('docker', ['kill', name], { stdio: 'ignore' });
+      else if (child.pid) {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          /* already gone */
+        }
+      }
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      if (docker) spawn('docker', ['kill', name], { stdio: 'ignore' });
-      else if (child.pid) process.kill(-child.pid, 'SIGKILL');
+      kill();
     }, timeoutMs);
+    const onAbort = () => {
+      cancelled = true;
+      kill();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       reject(
         docker && (err as NodeJS.ErrnoException).code === 'ENOENT'
           ? new Error('Docker CLI not found. Install Docker or set BUILD_ISOLATION=local.')
           : err,
       );
     });
-    child.on('close', (code, signal) => {
+    child.on('close', (code, exitSignal) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      if (cancelled) return reject(new CancelledError());
       if (timedOut) return reject(new Error(`Command timed out after ${Math.round(timeoutMs / 1000)}s`));
       if (code === 0) return resolve();
       if (docker && code === 125)
         return reject(new Error('Docker failed to start the build container. Is the Docker daemon running?'));
-      reject(new Error(`Command "${command}" exited with ${signal ?? `code ${code}`}`));
+      reject(new Error(`Command "${command}" exited with ${exitSignal ?? `code ${code}`}`));
     });
   });
 }

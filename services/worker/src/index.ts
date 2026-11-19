@@ -18,11 +18,17 @@ import {
   type WorkerInfo,
 } from '@deployx/shared';
 import { detectBuildPlan, resolveOutputDir } from './detect';
-import { runCommand } from './runner';
+import { CancelledError, runCommand } from './runner';
 
 const redis = createRedis('worker');
 const processId = `${os.hostname()}-${process.pid}`;
 let shuttingDown = false;
+
+/** Builds running in this process, so a "stop" from the console can abort them. */
+const running = new Map<string, AbortController>();
+const cancelSub = createRedis('worker-cancel');
+cancelSub.on('ready', () => void cancelSub.subscribe(keys.cancel));
+cancelSub.on('message', (_channel, id: string) => running.get(id)?.abort());
 
 /** Serialises log writes so lines keep their order even when stdout/stderr interleave. */
 function orderedLogger(r: Redis, id: string) {
@@ -39,14 +45,46 @@ function orderedLogger(r: Redis, id: string) {
   };
 }
 
+/** Prisma P1xxx = can't reach / lost the database (e.g. Neon waking from scale-to-zero, a network blip). */
+const isConnectionError = (err: unknown) => /^P10\d\d$/.test(String((err as { code?: string })?.code ?? ''));
+
+/**
+ * Claim with retries. The job is already off the Redis queue at this point, so giving up on a transient
+ * database error would leave the deployment "queued" forever: retry, and if the database is still
+ * unreachable put the job back on the queue (the conditional claim makes a duplicate harmless).
+ */
+async function claimWithRetry(id: string, workerId: string) {
+  const delays = [1000, 2000, 4000, 8000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await claimDeployment(redis, id, workerId);
+    } catch (err) {
+      if (!isConnectionError(err)) throw err;
+      if (attempt >= delays.length) {
+        await redis.rpush(keys.queue, id); // BRPOP takes from the right: it is picked up next
+        console.warn(`[worker ${workerId}] database unreachable, re-queued ${id}`);
+        return null;
+      }
+      console.warn(`[worker ${workerId}] database unreachable claiming ${id}, retrying in ${delays[attempt]}ms`);
+      await new Promise((r) => setTimeout(r, delays[attempt]));
+    }
+  }
+}
+
 async function build(id: string, workerId: string) {
   // Atomic queued → building transition in Postgres: a job can only ever be built once.
-  const deployment = await claimDeployment(redis, id, workerId);
+  const deployment = await claimWithRetry(id, workerId);
   if (!deployment) return;
 
   const log = orderedLogger(redis, id);
   const started = deployment.startedAt ?? Date.now();
   const dir = path.join(config.dataDir, 'builds', id);
+  const abort = new AbortController();
+  running.set(id, abort);
+  /** Between steps: stop here if the owner pressed Stop. */
+  const checkpoint = () => {
+    if (abort.signal.aborted) throw new CancelledError();
+  };
 
   await log.system(`Build started on ${workerId} (isolation: ${config.worker.isolation})`);
 
@@ -57,6 +95,7 @@ async function build(id: string, workerId: string) {
     const storage = await getStorage();
     const count = await downloadPrefix(storage, storageKeys.source(id), dir);
     await log.system(`Restored ${count} source files from storage`);
+    checkpoint();
 
     // 2. Detect framework + commands (user overrides win)
     const plan = await detectBuildPlan(dir);
@@ -73,6 +112,7 @@ async function build(id: string, workerId: string) {
         command,
         name: `deployx-${id}-${label}`,
         timeoutMs: config.worker.timeoutMs,
+        signal: abort.signal,
         onLine: (stream, line) => void (stream === 'stdout' ? log.stdout(line) : log.stderr(line)),
       });
       await log.system(`✓ ${label} finished in ${((Date.now() - t) / 1000).toFixed(1)}s`);
@@ -82,6 +122,8 @@ async function build(id: string, workerId: string) {
     if (installCommand) await exec('install', installCommand);
     if (buildCommand) await exec('build', buildCommand);
     else if (plan.packageManager !== 'none') await log.system('No "build" script found; deploying files as-is');
+
+    checkpoint();
 
     // 4. Locate output
     const outputDir = await resolveOutputDir(dir, deployment.outputDir ?? plan.outputDir);
@@ -96,11 +138,13 @@ async function build(id: string, workerId: string) {
     await log.system(`Using output directory: ${outputDir === '.' ? '(repository root)' : `${outputDir}/`}`);
 
     // 5. Upload artefacts
+    checkpoint();
     await updateDeployment(redis, id, { status: 'uploading', outputDir });
     let lastReport = 0;
     const { fileCount, totalBytes } = await uploadDirectory(storage, outPath, storageKeys.output(id), {
       ignore: (rel) => rel.split('/').some((s) => s === 'node_modules' || s === '.git'),
       onProgress: ({ done, total }) => {
+        checkpoint(); // abort the upload between files
         if (done === total || Date.now() - lastReport > 750) {
           lastReport = Date.now();
           void log.system(`  uploaded ${done}/${total} assets`);
@@ -108,6 +152,7 @@ async function build(id: string, workerId: string) {
       },
     });
 
+    checkpoint();
     const finishedAt = Date.now();
     await log.system(`✓ Deployment ready in ${((finishedAt - started) / 1000).toFixed(1)}s → ${deployment.url}`);
     await log.flush();
@@ -119,6 +164,15 @@ async function build(id: string, workerId: string) {
       totalBytes,
     });
   } catch (err) {
+    if (err instanceof CancelledError) {
+      // Status is already `cancelled` (set by the API). Drop any half-uploaded output so it's never served.
+      await log.system('Build process stopped.');
+      await log.flush();
+      await getStorage()
+        .then((s) => s.deletePrefix(storageKeys.output(id)))
+        .catch(() => {});
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     await log.stderr(`✗ Build failed: ${message}`);
     await log.flush();
@@ -130,6 +184,7 @@ async function build(id: string, workerId: string) {
       buildDurationMs: finishedAt - started,
     });
   } finally {
+    running.delete(id);
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     // Persist the full build log to Postgres; Redis keeps it briefly for live viewers.
     await archiveLogs(redis, id).catch((err) => console.error(`[worker] archiving logs for ${id} failed`, err));

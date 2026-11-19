@@ -1,8 +1,6 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import type { SystemHealth } from '@deployx/shared/types';
-import { api } from '@/lib/api';
 
 /** Re-renders every `interval` ms; used for live "elapsed" timers and relative times. */
 export function useNow(interval = 1000, enabled = true) {
@@ -13,30 +11,6 @@ export function useNow(interval = 1000, enabled = true) {
     return () => clearInterval(t);
   }, [interval, enabled]);
   return now;
-}
-
-export function useHealth(interval = 5000) {
-  const [health, setHealth] = useState<SystemHealth | null>(null);
-  const [reachable, setReachable] = useState(true);
-  useEffect(() => {
-    let cancelled = false;
-    const load = () =>
-      api
-        .health()
-        .then((h) => {
-          if (cancelled) return;
-          setHealth(h);
-          setReachable(true);
-        })
-        .catch(() => !cancelled && setReachable(false));
-    void load();
-    const t = setInterval(load, interval);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
-  }, [interval]);
-  return { health, reachable };
 }
 
 /** Global single-key shortcuts, ignored while typing in inputs. */
@@ -56,28 +30,6 @@ export function useHotkey(key: string, handler: (e: KeyboardEvent) => void) {
   }, [key, handler]);
 }
 
-type Theme = 'dark' | 'light';
-
-export function useTheme() {
-  // Server render assumes dark; the inline script in layout.tsx has already applied the saved theme.
-  const [theme, setTheme] = useState<Theme>('dark');
-  useEffect(() => {
-    setTheme((document.documentElement.dataset.theme as Theme | undefined) ?? 'dark');
-  }, []);
-  const toggle = useCallback(() => {
-    setTheme((t) => {
-      const next = t === 'dark' ? 'light' : 'dark';
-      document.documentElement.dataset.theme = next;
-      try {
-        localStorage.setItem('deployx-theme', next);
-      } catch {
-        /* storage unavailable */
-      }
-      return next;
-    });
-  }, []);
-  return { theme, toggle };
-}
 
 export function useCopy(timeout = 1500) {
   const [copied, setCopied] = useState(false);

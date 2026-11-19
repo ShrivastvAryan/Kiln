@@ -1,22 +1,41 @@
-# Infrastructure for Kiln: PostgreSQL (source of truth), Redis (queue + pub/sub) and MinIO (S3-compatible storage).
-# Start with: npm run infra:up
-services:
-  postgres:
-    image: postgres:17-alpine
-    environment:
-      POSTGRES_USER: deployx
-      POSTGRES_PASSWORD: deployx
-      POSTGRES_DB: deployx
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U deployx"]
-      interval: 5s
-      retries: 10
-    restart: unless-stopped
+# Kiln backend: everything except the Next.js console.
+#
+#   docker compose up -d --build     # or: npm run services:up
+#   bun dev                          # the console on http://localhost:3000
+#
+# Database: Neon Postgres (connection strings in .env, from `neon env pull`).
+# Infrastructure here: Redis (queue + pub/sub) and SeaweedFS (S3-compatible storage).
+# Services: migrate (one-off) → api :8000, worker, router :3001.
+#
+# Secrets (Neon connection strings, S3 keys) live in .env, which Compose reads automatically and git ignores.
+# Copy .env.example to .env and change the values. `:?` makes Compose stop with an error if one is missing.
 
+# Shared settings for the Kiln service containers (one image, different commands).
+x-kiln: &kiln
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: kiln-services:local
+  restart: unless-stopped
+  # Public resolvers: some ISP routers can't resolve Neon's endpoint hostnames (*.c-2.*.aws.neon.tech).
+  dns: [1.1.1.1, 8.8.8.8]
+  environment: &kiln-env
+    REDIS_URL: redis://redis:6379
+    DATABASE_URL: ${DATABASE_URL:?set in .env (neon env pull)}
+    DATABASE_URL_UNPOOLED: ${DATABASE_URL_UNPOOLED:?set in .env (neon env pull)}
+    STORAGE_DRIVER: s3
+    S3_ENDPOINT: http://seaweedfs:8333
+    S3_REGION: us-east-1
+    S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set in .env}
+    S3_SECRET_KEY: ${S3_SECRET_KEY:?set in .env}
+    S3_BUCKET: ${S3_BUCKET:-deployx}
+    ROOT_DOMAIN: localhost
+    API_PORT: 8000
+    ROUTER_PORT: 3001
+    DASHBOARD_URL: ${DASHBOARD_URL:-http://localhost:3000}
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
@@ -24,22 +43,91 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
     restart: unless-stopped
 
-  minio:
-    image: minio/minio:latest
-    command: ["server", "/data", "--console-address", ":9001"]
+  # S3-compatible object storage (MinIO no longer publishes images). Kiln talks to it through the
+  # standard S3 API, so AWS S3 or Cloudflare R2 can replace it by changing S3_ENDPOINT.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.54
+    command: ["server", "-s3", "-dir=/data", "-ip.bind=0.0.0.0", "-volume.max=0"]
     environment:
-      MINIO_ROOT_USER: deployx
-      MINIO_ROOT_PASSWORD: deployx-secret
+      # SeaweedFS enforces these keys on every S3 request (wrong or unknown keys are rejected).
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?set in .env}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?set in .env}
     ports:
-      - "9000:9000" # S3 API
-      - "9001:9001" # Web console
+      - "8333:8333" # S3 API
+      - "9333:9333" # cluster status UI
     volumes:
-      - minio-data:/data
+      - seaweedfs-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
+      interval: 5s
+      retries: 20
     restart: unless-stopped
+
+  # ── Kiln services ───────────────────────────────────────────────────────────
+
+  # Applies Prisma migrations once, then exits. The services below wait for it.
+  migrate:
+    <<: *kiln
+    restart: "no"
+    command: ["npx", "prisma", "migrate", "deploy", "--schema", "packages/shared/prisma/schema.prisma"]
+
+  # REST + SSE control plane and repository uploader.
+  api:
+    <<: *kiln
+    command: ["npm", "start", "-w", "@deployx/api"]
+    ports:
+      - "8000:8000"
+    # Auth secrets go to the API only (the worker and router never verify tokens).
+    environment:
+      <<: *kiln-env
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set in .env (openssl rand -base64 48)}
+      API_PUBLIC_URL: ${API_PUBLIC_URL:-http://localhost:8000}
+      COOKIE_SECURE: ${COOKIE_SECURE:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-}
+      GITHUB_APP_CLIENT_ID: ${GITHUB_APP_CLIENT_ID:-}
+      GITHUB_APP_CLIENT_SECRET: ${GITHUB_APP_CLIENT_SECRET:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+    depends_on: &kiln-deps
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+
+  # Build worker pool. Builds run in sibling containers on the host's Docker daemon, so the
+  # build folder must exist at the SAME path inside this container and on the host.
+  worker:
+    <<: *kiln
+    command: ["npm", "start", "-w", "@deployx/worker"]
+    environment:
+      <<: *kiln-env
+      BUILD_ISOLATION: docker
+      BUILD_IMAGE: node:22-alpine
+      WORKER_CONCURRENCY: 2
+      DATA_DIR: ${PWD}/.data/docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}/.data/docker:${PWD}/.data/docker
+    depends_on: *kiln-deps
+
+  # Wildcard subdomain router: http://<id>.localhost:3001
+  router:
+    <<: *kiln
+    command: ["npm", "start", "-w", "@deployx/router"]
+    ports:
+      - "3001:3001"
+    depends_on: *kiln-deps
 
 volumes:
-  postgres-data:
   redis-data:
-  minio-data:
+  seaweedfs-data:

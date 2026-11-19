@@ -1,5 +1,6 @@
 import type { Deployment as DeploymentRow, Prisma } from '@prisma/client';
 import type { Redis } from 'ioredis';
+import { appUrl } from './config';
 import { prisma } from './db';
 import { keys } from './redis';
 import type { Deployment, DeploymentStatus, LogLine, LogStream, PlatformEvent, PlatformStats } from './types';
@@ -16,10 +17,15 @@ const LOG_BUFFER_TTL_SECONDS = 60 * 60;
 
 // ── Mapping ────────────────────────────────────────────────────────────────────
 
+/** Deployment rows are always loaded with their project's slug (for the app URL). */
+const withSlug = { project: { select: { slug: true } } } as const;
+type Row = DeploymentRow & { project?: { slug: string | null } | null };
+
 /** DB row → API shape (epoch-ms timestamps, no nulls, BigInt → number). */
-function toDeployment(row: DeploymentRow): Deployment {
+function toDeployment(row: Row): Deployment {
   return {
     id: row.id,
+    ownerId: row.ownerId ?? undefined,
     repoUrl: row.repoUrl,
     branch: row.branch,
     status: row.status,
@@ -41,20 +47,97 @@ function toDeployment(row: DeploymentRow): Deployment {
     fileCount: row.fileCount ?? undefined,
     totalBytes: row.totalBytes == null ? undefined : Number(row.totalBytes),
     error: row.error ?? undefined,
+    pausedAt: row.pausedAt?.getTime(),
+    appUrl: row.project?.slug ? appUrl(row.project.slug) : undefined,
   };
 }
 
-export type DeploymentPatch = Partial<
-  Omit<Deployment, 'id' | 'repoUrl' | 'url' | 'createdAt' | 'updatedAt'>
->;
+// ── Apps (projects): slugs and stable URLs ─────────────────────────────────────
 
-function toUpdateData(patch: DeploymentPatch): Prisma.DeploymentUpdateInput {
-  const { startedAt, finishedAt, totalBytes, ...rest } = patch;
+/**
+ * "ShrivastvAryan/bg-remover" → "shrivastvaryan-bg-remover". Always contains a hyphen, which build ids
+ * never do, so the router can tell an app URL from a build URL.
+ */
+export function slugFor(repoUrl: string) {
+  let s = projectName(repoUrl)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+    .replace(/-+$/, '');
+  if (!/^[a-z]/.test(s)) s = `app-${s}`;
+  if (!s.includes('-')) s = `${s}-app`;
+  return s;
+}
+
+/** Gives a project its slug if it has none, adding -2, -3… on collisions. */
+async function ensureProjectSlug(projectId: string, repoUrl: string) {
+  const project = await prisma.project.findUnique({ where: { id: projectId }, select: { slug: true } });
+  if (project?.slug) return project.slug;
+  const base = slugFor(repoUrl);
+  for (let n = 1; n < 100; n++) {
+    const slug = n === 1 ? base : `${base.slice(0, 44)}-${n}`;
+    if (await prisma.project.findUnique({ where: { slug }, select: { id: true } })) continue; // taken
+    try {
+      await prisma.project.update({ where: { id: projectId }, data: { slug } });
+      return slug;
+    } catch (err) {
+      if ((err as { code?: string }).code !== 'P2002') throw err; // taken in a race: try the next one
+    }
+  }
+  throw new Error('Could not allocate an app slug');
+}
+
+/** Points the app's stable URL at its latest live build (or clears it when it has none). */
+export async function refreshAppAlias(redis: Redis, projectId: string) {
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: {
+      slug: true,
+      deployments: { where: { status: 'ready' }, orderBy: { createdAt: 'desc' }, take: 1, select: { id: true } },
+    },
+  });
+  if (!project?.slug) return null;
+  const live = project.deployments[0]?.id ?? null;
+  if (live) await redis.set(keys.alias(project.slug), live);
+  else await redis.del(keys.alias(project.slug));
+  return live;
+}
+
+/**
+ * Router fallback when the alias isn't cached: which build an app slug serves.
+ * `undefined` = no such app; `null` = the app exists but has no live build yet.
+ */
+export async function resolveAppSlug(redis: Redis, slug: string): Promise<string | null | undefined> {
+  const cached = await redis.get(keys.alias(slug));
+  if (cached) return cached;
+  const project = await prisma.project.findUnique({ where: { slug }, select: { id: true } });
+  if (!project) return undefined;
+  return refreshAppAlias(redis, project.id);
+}
+
+/** Startup task: give older projects a slug and (re)build every app alias. */
+export async function syncAppAliases(redis: Redis) {
+  const projects = await prisma.project.findMany({ select: { id: true, repoUrl: true, slug: true } });
+  for (const p of projects) {
+    if (!p.slug) await ensureProjectSlug(p.id, p.repoUrl);
+    await refreshAppAlias(redis, p.id);
+  }
+  return projects.length;
+}
+
+export type DeploymentPatch = Partial<
+  Omit<Deployment, 'id' | 'repoUrl' | 'url' | 'createdAt' | 'updatedAt' | 'pausedAt'>
+> & { pausedAt?: number | null };
+
+function toUpdateData(patch: DeploymentPatch): Prisma.DeploymentUpdateManyMutationInput {
+  const { startedAt, finishedAt, totalBytes, pausedAt, ...rest } = patch;
   return {
     ...rest,
     ...(startedAt !== undefined && { startedAt: new Date(startedAt) }),
     ...(finishedAt !== undefined && { finishedAt: new Date(finishedAt) }),
     ...(totalBytes !== undefined && { totalBytes: BigInt(totalBytes) }),
+    ...(pausedAt !== undefined && { pausedAt: pausedAt === null ? null : new Date(pausedAt) }),
   };
 }
 
@@ -70,6 +153,7 @@ function projectName(repoUrl: string) {
 
 export interface NewDeployment {
   id: string;
+  ownerId: string;
   repoUrl: string;
   branch: string;
   url: string;
@@ -78,38 +162,69 @@ export interface NewDeployment {
   outputDir?: string;
 }
 
-/** Creates a deployment, creating its project (one per repository) on first deploy. */
+/** Creates a deployment, creating its project (one per owner + repository) on first deploy. */
 export async function createDeployment(redis: Redis, input: NewDeployment) {
-  const row = await prisma.deployment.create({
+  const { ownerId, ...fields } = input;
+  let row = await prisma.deployment.create({
     data: {
-      ...input,
+      ...fields,
+      owner: { connect: { id: ownerId } },
       project: {
         connectOrCreate: {
-          where: { repoUrl: input.repoUrl },
-          create: { repoUrl: input.repoUrl, name: projectName(input.repoUrl) },
+          where: { ownerId_repoUrl: { ownerId, repoUrl: input.repoUrl } },
+          create: { repoUrl: input.repoUrl, name: projectName(input.repoUrl), owner: { connect: { id: ownerId } } },
         },
       },
     },
+    include: withSlug,
   });
+  // First deploy of this app: give it its stable URL slug.
+  if (!row.project?.slug) {
+    await ensureProjectSlug(row.projectId, row.repoUrl);
+    row = (await prisma.deployment.findUniqueOrThrow({ where: { id: row.id }, include: withSlug }))!;
+  }
   const deployment = toDeployment(row);
   await publish(redis, { type: 'deployment.updated', deployment });
   return deployment;
 }
 
-export async function getDeployment(id: string) {
-  const row = await prisma.deployment.findUnique({ where: { id } });
+/**
+ * Fetch one deployment. With `ownerId`, it only matches that user's deployment (API routes always pass it);
+ * without, it's an internal lookup (worker, router).
+ */
+export async function getDeployment(id: string, ownerId?: string) {
+  const row = await prisma.deployment.findFirst({ where: ownerId ? { id, ownerId } : { id }, include: withSlug });
   return row ? toDeployment(row) : null;
 }
 
-export async function listDeployments(limit = 200) {
-  const rows = await prisma.deployment.findMany({ orderBy: { createdAt: 'desc' }, take: limit });
+export async function listDeployments(ownerId: string, limit = 200) {
+  const rows = await prisma.deployment.findMany({
+    where: { ownerId },
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    include: withSlug,
+  });
   return rows.map(toDeployment);
 }
 
+/**
+ * Applies a patch and broadcasts it. A cancelled deployment is final: patches never move it out of
+ * `cancelled` (a worker or uploader racing the cancel just gets `null` back).
+ * Returns null if the deployment was cancelled or deleted meanwhile.
+ */
 export async function updateDeployment(redis: Redis, id: string, patch: DeploymentPatch) {
   try {
-    const row = await prisma.deployment.update({ where: { id }, data: toUpdateData(patch) });
-    const deployment = toDeployment(row);
+    const { count } = await prisma.deployment.updateMany({
+      where: { id, status: { not: 'cancelled' } },
+      data: toUpdateData(patch),
+    });
+    if (count === 0) return null;
+    if (patch.status === 'ready') {
+      // A new live build: the app's stable URL now serves it.
+      const row = await prisma.deployment.findUnique({ where: { id }, select: { projectId: true } });
+      if (row) await refreshAppAlias(redis, row.projectId);
+    }
+    const deployment = (await getDeployment(id))!;
     await publish(redis, { type: 'deployment.updated', deployment });
     return deployment;
   } catch (err) {
@@ -133,22 +248,69 @@ export async function claimDeployment(redis: Redis, id: string, workerId: string
   return deployment;
 }
 
-export async function deleteDeployment(redis: Redis, id: string) {
-  await prisma.deployment.delete({ where: { id } }); // build_logs cascade
-  await redis.del(keys.logs(id), keys.logSeq(id));
-  await publish(redis, { type: 'deployment.deleted', id });
+/**
+ * Stops an in-progress deployment. The conditional UPDATE makes it race-free: only a deployment that
+ * is still active becomes `cancelled`, and nothing moves it out again (see updateDeployment).
+ * Then the job is pulled off the queue and every worker/uploader is told to abort it.
+ * Returns the cancelled deployment, or null if it had already finished.
+ */
+export async function cancelDeployment(redis: Redis, id: string) {
+  const before = await getDeployment(id);
+  if (!before) return null;
+  const now = Date.now();
+  const { count } = await prisma.deployment.updateMany({
+    where: { id, status: { in: ['cloning', 'queued', 'building', 'uploading'] } },
+    data: {
+      status: 'cancelled',
+      error: 'Stopped by user',
+      finishedAt: new Date(now),
+      ...(before.startedAt && { buildDurationMs: now - before.startedAt }),
+    },
+  });
+  if (count === 0) return null;
+  await redis.lrem(keys.queue, 0, id);
+  await redis.publish(keys.cancel, id);
+  await appendLog(redis, id, 'stderr', '■ Deployment stopped by user');
+  // Nobody else is working on a queued job, so archive its log here (worker/uploader do it otherwise).
+  if (before.status === 'queued') await archiveLogs(redis, id).catch(() => {});
+  const deployment = (await getDeployment(id))!;
+  await publish(redis, { type: 'deployment.updated', deployment });
+  return deployment;
 }
 
-export async function getStats(redis: Redis): Promise<PlatformStats> {
+/** Pause (stop serving) or resume a ready deployment. Returns null unless it is ready. */
+export async function setPaused(redis: Redis, id: string, paused: boolean) {
+  const { count } = await prisma.deployment.updateMany({
+    where: { id, status: 'ready' },
+    data: { pausedAt: paused ? new Date() : null },
+  });
+  if (count === 0) return null;
+  // The router checks this key on every request (cheaper than a database lookup per asset).
+  if (paused) await redis.set(keys.paused(id), '1');
+  else await redis.del(keys.paused(id));
+  const deployment = (await getDeployment(id))!;
+  await publish(redis, { type: 'deployment.updated', deployment });
+  return deployment;
+}
+
+export async function deleteDeployment(redis: Redis, id: string, ownerId?: string) {
+  const row = await prisma.deployment.delete({ where: { id } }); // build_logs cascade
+  await redis.del(keys.logs(id), keys.logSeq(id), keys.paused(id));
+  // If that was the app's live build, its URL falls back to the previous live one.
+  await refreshAppAlias(redis, row.projectId);
+  await publish(redis, { type: 'deployment.deleted', id, ownerId });
+}
+
+export async function getStats(redis: Redis, ownerId: string): Promise<PlatformStats> {
   const [groups, avg, queueLength] = await Promise.all([
-    prisma.deployment.groupBy({ by: ['status'], _count: { _all: true } }),
+    prisma.deployment.groupBy({ by: ['status'], where: { ownerId }, _count: { _all: true } }),
     prisma.deployment.aggregate({
-      where: { status: 'ready', buildDurationMs: { not: null } },
+      where: { ownerId, status: 'ready', buildDurationMs: { not: null } },
       _avg: { buildDurationMs: true },
     }),
     redis.llen(keys.queue),
   ]);
-  const byStatus = { cloning: 0, queued: 0, building: 0, uploading: 0, ready: 0, failed: 0 } as Record<
+  const byStatus = { cloning: 0, queued: 0, building: 0, uploading: 0, ready: 0, failed: 0, cancelled: 0 } as Record<
     DeploymentStatus,
     number
   >;

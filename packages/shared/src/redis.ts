@@ -14,6 +14,12 @@ export const keys = {
   events: 'deployx:events',
   worker: (id: string) => `deployx:worker:${id}`,
   workerPattern: 'deployx:worker:*',
+  /** Pub/sub channel: a deployment id published here must stop building now. */
+  cancel: 'deployx:cancel',
+  /** Present while a deployment is paused; the router checks it on every request. */
+  paused: (id: string) => `deployx:paused:${id}`,
+  /** App slug → id of the app's latest live (ready) build; the router resolves app URLs through it. */
+  alias: (slug: string) => `deployx:alias:${slug}`,
 };
 
 export function createRedis(name: string) {

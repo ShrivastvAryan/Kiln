@@ -7,8 +7,8 @@ generator client {
 
 datasource db {
   provider  = "postgresql"
-  url       = env("DATABASE_URL") // pooled connection (Neon: the "-pooler" host)
-  directUrl = env("DIRECT_URL")   // direct connection, used by migrations
+  url       = env("DATABASE_URL") // Neon pooled connection ("-pooler" host): app queries
+  directUrl = env("DATABASE_URL_UNPOOLED") // Neon direct connection: Prisma Migrate (fails through PgBouncer)
 }
 
 enum DeploymentStatus {
@@ -18,6 +18,7 @@ enum DeploymentStatus {
   uploading
   ready
   failed
+  cancelled
 }
 
 enum LogStream {
@@ -29,50 +30,61 @@ enum LogStream {
 /// A Git repository. Every deploy of the same repo belongs to one project.
 model Project {
   id          String       @id @default(cuid())
-  name        String       // "owner/repo"
-  repoUrl     String       @unique @map("repo_url")
+  ownerId     String?      @map("owner_id")
+  owner       User?        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String // "owner/repo"
+  /// DNS-safe, globally unique; the app's stable URL is http://<slug>.<root-domain>, serving its latest live build.
+  slug        String?      @unique
+  repoUrl     String       @map("repo_url")
   createdAt   DateTime     @default(now()) @map("created_at")
   updatedAt   DateTime     @updatedAt @map("updated_at")
   deployments Deployment[]
 
+  @@unique([ownerId, repoUrl])
   @@map("projects")
 }
 
 /// One immutable build of a project, served at http://<id>.<root-domain>.
 model Deployment {
   /// Short DNS-safe id, doubles as the subdomain.
-  id              String           @id
-  projectId       String           @map("project_id")
-  project         Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  repoUrl         String           @map("repo_url")
-  branch          String
-  status          DeploymentStatus @default(cloning)
-  url             String
+  id        String           @id
+  projectId String           @map("project_id")
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// Denormalised from the project so every per-user query is a single indexed lookup.
+  ownerId   String?          @map("owner_id")
+  owner     User?            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  repoUrl   String           @map("repo_url")
+  branch    String
+  status    DeploymentStatus @default(cloning)
+  url       String
 
-  commitSha       String?          @map("commit_sha")
-  commitMessage   String?          @map("commit_message")
-  commitAuthor    String?          @map("commit_author")
+  commitSha     String? @map("commit_sha")
+  commitMessage String? @map("commit_message")
+  commitAuthor  String? @map("commit_author")
 
-  framework       String?
-  packageManager  String?          @map("package_manager")
-  installCommand  String?          @map("install_command")
-  buildCommand    String?          @map("build_command")
-  outputDir       String?          @map("output_dir")
+  framework      String?
+  packageManager String? @map("package_manager")
+  installCommand String? @map("install_command")
+  buildCommand   String? @map("build_command")
+  outputDir      String? @map("output_dir")
 
-  workerId        String?          @map("worker_id")
-  fileCount       Int?             @map("file_count")
-  totalBytes      BigInt?          @map("total_bytes")
-  buildDurationMs Int?             @map("build_duration_ms")
+  workerId        String? @map("worker_id")
+  fileCount       Int?    @map("file_count")
+  totalBytes      BigInt? @map("total_bytes")
+  buildDurationMs Int?    @map("build_duration_ms")
   error           String?
 
-  createdAt       DateTime         @default(now()) @map("created_at")
-  updatedAt       DateTime         @updatedAt @map("updated_at")
-  startedAt       DateTime?        @map("started_at")
-  finishedAt      DateTime?        @map("finished_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+  startedAt  DateTime? @map("started_at")
+  finishedAt DateTime? @map("finished_at")
+  /// Set while a ready deployment is paused: the router serves a "paused" page instead of the site.
+  pausedAt   DateTime? @map("paused_at")
 
-  logs            BuildLog[]
+  logs BuildLog[]
 
   @@index([createdAt(sort: Desc)])
+  @@index([ownerId, createdAt(sort: Desc)])
   @@index([projectId, createdAt(sort: Desc)])
   @@index([status])
   @@map("deployments")
@@ -89,4 +101,76 @@ model BuildLog {
 
   @@id([deploymentId, seq])
   @@map("build_logs")
+}
+
+// ── Auth ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id            String            @id @default(cuid())
+  email         String            @unique // stored lower-case
+  name          String
+  avatarUrl     String?           @map("avatar_url")
+  /// Argon2id hash; null for accounts that only sign in with Google.
+  passwordHash  String?           @map("password_hash")
+  emailVerified Boolean           @default(false) @map("email_verified")
+  createdAt     DateTime          @default(now()) @map("created_at")
+  updatedAt     DateTime          @updatedAt @map("updated_at")
+  accounts      OAuthAccount[]
+  sessions      Session[]
+  github        GitHubConnection?
+  projects      Project[]
+  deployments   Deployment[]
+
+  @@map("users")
+}
+
+/// A linked external identity (Google today).
+model OAuthAccount {
+  id                String   @id @default(cuid())
+  userId            String   @map("user_id")
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider          String
+  providerAccountId String   @map("provider_account_id")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("oauth_accounts")
+}
+
+/// One row per refresh token (only its SHA-256 hash is stored). Tokens rotate on every refresh;
+/// all rows from one sign-in share a familyId, so reuse of a rotated token revokes the whole family.
+model Session {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  familyId  String    @map("family_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  rotatedAt DateTime? @map("rotated_at")
+  revokedAt DateTime? @map("revoked_at")
+  userAgent String?   @map("user_agent")
+  ip        String?
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("sessions")
+}
+
+/// A user's link to the Kiln GitHub App: who they are on GitHub and which app installations
+/// (accounts/orgs where they installed Kiln) they can access. No GitHub token is stored:
+/// short-lived installation tokens are minted per request from the app's private key.
+model GitHubConnection {
+  id              String   @id @default(cuid())
+  userId          String   @unique @map("user_id")
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  githubUserId    BigInt   @unique @map("github_user_id")
+  login           String
+  avatarUrl       String?  @map("avatar_url")
+  installationIds BigInt[] @map("installation_ids")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("github_connections")
 }

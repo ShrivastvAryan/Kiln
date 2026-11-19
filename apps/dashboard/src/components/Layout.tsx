@@ -3,12 +3,12 @@
 import { useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { LayoutGrid, Menu, Moon, Plus, Server, Sun, X } from 'lucide-react';
-import { useDeployments } from '@/hooks/deployments';
-import { useHealth, useHotkey, useTheme } from '@/hooks/misc';
+import { LayoutGrid, Menu, Plus, X } from 'lucide-react';
+import { useHotkey } from '@/hooks/misc';
 import { cn } from '@/lib/format';
 import { LogoMark } from './LogoMark';
 import { Kbd } from './ui';
+import { UserMenu } from './UserMenu';
 
 export function Logo() {
   return (
@@ -26,54 +26,9 @@ export function Logo() {
 const NAV = [
   { to: '/deployments', label: 'Deployments', icon: LayoutGrid, end: true },
   { to: '/new', label: 'New deployment', icon: Plus, kbd: 'N' },
-  { to: '/system', label: 'Infrastructure', icon: Server },
 ];
 
-function SystemStatus() {
-  const { health, reachable } = useHealth();
-  const { live } = useDeployments();
-  const workers = health?.workers ?? [];
-  const busy = workers.filter((w) => w.busyWith).length;
-
-  const rows = [
-    { label: 'API', ok: reachable, detail: live ? 'live' : reachable ? 'polling' : 'offline' },
-    { label: 'Postgres', ok: reachable && !!health?.database, detail: health?.database ? 'connected' : 'down' },
-    { label: 'Redis', ok: reachable && !!health?.redis, detail: health?.redis ? 'connected' : 'down' },
-    {
-      label: 'Storage',
-      ok: reachable && !!health?.storage,
-      detail: health ? (health.storageDriver === 's3' ? 'S3 / MinIO' : 'local disk') : '—',
-    },
-    {
-      label: 'Workers',
-      ok: workers.length > 0,
-      detail: workers.length ? `${busy}/${workers.length} busy` : 'none online',
-    },
-  ];
-
-  return (
-    <Link
-      href="/system"
-      className="block rounded-lg border border-line bg-bg/50 p-3 text-xs transition-colors hover:border-line-strong"
-    >
-      <p className="mb-2 font-medium text-muted">System status</p>
-      <ul className="space-y-1.5">
-        {rows.map((r) => (
-          <li key={r.label} className="flex items-center justify-between gap-2">
-            <span className="flex items-center gap-2 text-muted">
-              <span className={cn('size-1.5 rounded-full', r.ok ? 'bg-success' : 'bg-danger')} />
-              {r.label}
-            </span>
-            <span className="text-subtle">{r.detail}</span>
-          </li>
-        ))}
-      </ul>
-    </Link>
-  );
-}
-
 function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
-  const { theme, toggle } = useTheme();
   const pathname = usePathname();
   return (
     <div className="flex h-full flex-col gap-6 p-4">
@@ -102,15 +57,8 @@ function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
           );
         })}
       </nav>
-      <div className="mt-auto space-y-3">
-        <SystemStatus />
-        <button
-          onClick={toggle}
-          className="flex h-9 w-full items-center gap-3 rounded-lg px-3 text-sm text-muted transition-colors hover:bg-hover hover:text-fg cursor-pointer"
-        >
-          {theme === 'dark' ? <Sun className="size-4" /> : <Moon className="size-4" />}
-          {theme === 'dark' ? 'Light mode' : 'Dark mode'}
-        </button>
+      <div className="mt-auto">
+        <UserMenu />
       </div>
     </div>
   );

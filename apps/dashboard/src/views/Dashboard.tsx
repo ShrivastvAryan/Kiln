@@ -17,6 +17,7 @@ import {
   Timer,
 } from 'lucide-react';
 import { ACTIVE_STATUSES, type Deployment, type DeploymentStatus } from '@deployx/shared/types';
+import { GitHubConnectCard } from '@/components/GitHubConnectCard';
 import { PageHeader } from '@/components/Layout';
 import { Button, Card, GitHubIcon, Kbd, StatusBadge, StatusDot } from '@/components/ui';
 import { useDeployments } from '@/hooks/deployments';
@@ -59,7 +60,32 @@ function StatCard({
   );
 }
 
-function DeploymentRow({ d, now }: { d: Deployment; now: number }) {
+/** One app = every build of the same repository. Builds are newest first. */
+interface App {
+  repoUrl: string;
+  latest: Deployment;
+  builds: Deployment[];
+  /** Most recent build that is live (ready), if any. */
+  live?: Deployment;
+}
+
+function groupByApp(deployments: Deployment[]): App[] {
+  const map = new Map<string, Deployment[]>();
+  for (const d of [...deployments].sort((a, b) => b.createdAt - a.createdAt)) {
+    const list = map.get(d.repoUrl);
+    if (list) list.push(d);
+    else map.set(d.repoUrl, [d]);
+  }
+  return [...map.entries()].map(([repoUrl, builds]) => ({
+    repoUrl,
+    latest: builds[0],
+    builds,
+    live: builds.find((b) => b.status === 'ready'),
+  }));
+}
+
+function AppRow({ app, now }: { app: App; now: number }) {
+  const d = app.latest;
   const active = ACTIVE_STATUSES.includes(d.status);
   const duration = active ? now - (d.startedAt ?? d.createdAt) : d.buildDurationMs;
   return (
@@ -74,7 +100,14 @@ function DeploymentRow({ d, now }: { d: Deployment; now: number }) {
             {repoHost(d.repoUrl) === 'github' ? <GitHubIcon className="size-4" /> : <Layers className="size-4" />}
           </span>
           <div className="min-w-0">
-            <p className="truncate text-sm font-medium">{repoName(d.repoUrl)}</p>
+            <p className="flex min-w-0 items-center gap-2 text-sm font-medium">
+              <span className="truncate">{repoName(d.repoUrl)}</span>
+              {app.builds.length > 1 && (
+                <span className="shrink-0 rounded-full bg-elevated px-1.5 py-px text-[10px] font-normal text-subtle tabular-nums">
+                  {app.builds.length} builds
+                </span>
+              )}
+            </p>
             <p className="flex min-w-0 items-center gap-1.5 text-xs text-subtle">
               <GitBranch className="size-3 shrink-0" />
               <span className="truncate">{d.branch || 'default'}</span>
@@ -93,10 +126,13 @@ function DeploymentRow({ d, now }: { d: Deployment; now: number }) {
         <div className="col-span-2 min-w-0 md:col-span-1">
           {d.status === 'ready' ? (
             <span className="inline-flex max-w-full items-center gap-1 truncate font-mono text-xs text-muted group-hover:text-fg">
-              {displayUrl(d.url)}
+              {displayUrl(d.appUrl ?? d.url)}
             </span>
-          ) : d.status === 'failed' ? (
-            <span className="block truncate text-xs text-danger/90">{d.error ?? 'Build failed'}</span>
+          ) : d.status === 'failed' || d.status === 'cancelled' ? (
+            <span className={cn('block truncate text-xs', d.status === 'failed' ? 'text-danger/90' : 'text-subtle')}>
+              {d.status === 'failed' ? (d.error ?? 'Build failed') : 'Stopped'}
+              {app.live && <span className="text-subtle"> · still live at {displayUrl(app.live.appUrl ?? app.live.url)}</span>}
+            </span>
           ) : (
             <span className="text-xs text-subtle">{d.framework ?? 'Detecting framework…'}</span>
           )}
@@ -104,7 +140,7 @@ function DeploymentRow({ d, now }: { d: Deployment; now: number }) {
 
         {/* Status */}
         <div className="row-start-1 md:row-auto">
-          <StatusBadge status={d.status} />
+          <StatusBadge status={d.status} paused={!!d.pausedAt} />
         </div>
 
         {/* Time */}
@@ -169,6 +205,8 @@ export function DashboardPage() {
   const now = useNow(1000, hasActive);
   useHotkey('/', () => searchRef.current?.focus());
 
+  const apps = useMemo(() => groupByApp(deployments), [deployments]);
+
   const stats = useMemo(() => {
     const ready = deployments.filter((d) => d.status === 'ready');
     const failed = deployments.filter((d) => d.status === 'failed').length;
@@ -177,38 +215,40 @@ export function DashboardPage() {
     const avg = timed.length ? timed.reduce((s, d) => s + d.buildDurationMs!, 0) / timed.length : null;
     const finished = ready.length + failed;
     return {
-      total: deployments.length,
-      live: ready.length,
+      total: apps.length,
+      builds: deployments.length,
+      live: apps.filter((a) => a.live && !a.live.pausedAt).length,
       active,
       successRate: finished ? Math.round((ready.length / finished) * 100) : null,
       avg,
     };
-  }, [deployments]);
+  }, [deployments, apps]);
 
+  // Filters and search work on apps, by the status of their latest build.
   const counts = useMemo(
-    () => Object.fromEntries(FILTERS.map((f) => [f.key, deployments.filter((d) => f.match(d.status)).length])),
-    [deployments],
+    () => Object.fromEntries(FILTERS.map((f) => [f.key, apps.filter((a) => f.match(a.latest.status)).length])),
+    [apps],
   );
 
   const filtered = useMemo(() => {
     const f = FILTERS.find((x) => x.key === filter)!;
     const q = query.trim().toLowerCase();
-    return deployments.filter(
-      (d) =>
-        f.match(d.status) &&
+    return apps.filter(
+      (a) =>
+        f.match(a.latest.status) &&
         (!q ||
-          d.repoUrl.toLowerCase().includes(q) ||
-          d.id.includes(q) ||
-          d.branch.toLowerCase().includes(q) ||
-          d.commitMessage?.toLowerCase().includes(q)),
+          a.repoUrl.toLowerCase().includes(q) ||
+          a.builds.some(
+            (d) => d.id.includes(q) || d.branch.toLowerCase().includes(q) || d.commitMessage?.toLowerCase().includes(q),
+          )),
     );
-  }, [deployments, filter, query]);
+  }, [apps, filter, query]);
 
   return (
     <>
       <PageHeader
         title="Deployments"
-        description="Every push becomes an immutable deployment with its own URL."
+        description="One row per app. Open it to see the latest build and its history."
         actions={
           <Button variant="primary" icon={<Plus className="size-4" />} onClick={() => router.push('/new')}>
             New deployment
@@ -217,8 +257,15 @@ export function DashboardPage() {
         }
       />
 
+      <GitHubConnectCard />
+
       <div className="mb-8 grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <StatCard label="Total deployments" value={String(stats.total)} hint={`${stats.live} live`} icon={Layers} />
+        <StatCard
+          label="Apps"
+          value={String(stats.total)}
+          hint={`${stats.live} live · ${stats.builds} build${stats.builds === 1 ? '' : 's'}`}
+          icon={Layers}
+        />
         <StatCard
           label="In progress"
           value={String(stats.active)}
@@ -268,8 +315,8 @@ export function DashboardPage() {
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === 'Escape' && (setQuery(''), e.currentTarget.blur())}
-            placeholder="Search repos, branches, commits…"
-            aria-label="Search deployments"
+            placeholder="Search apps, branches, commits…"
+            aria-label="Search apps"
             className="h-9 w-full rounded-lg border border-line bg-surface pr-9 pl-9 text-sm placeholder:text-subtle focus:border-accent focus:ring-4 focus:ring-accent-soft focus:outline-none"
           />
           <span className="absolute top-1/2 right-2.5 -translate-y-1/2">
@@ -283,19 +330,19 @@ export function DashboardPage() {
       ) : deployments.length === 0 ? (
         <EmptyState />
       ) : filtered.length === 0 ? (
-        <Card className="py-14 text-center text-sm text-muted">No deployments match your filters.</Card>
+        <Card className="py-14 text-center text-sm text-muted">No apps match your filters.</Card>
       ) : (
         <Card className="overflow-hidden">
           <div className="hidden grid-cols-[minmax(0,2.2fr)_minmax(0,1.4fr)_110px_100px_20px] gap-4 border-b border-line bg-elevated/40 px-5 py-2.5 text-xs font-medium text-subtle md:grid">
-            <span>Project</span>
-            <span>Deployment</span>
+            <span>App</span>
+            <span>Latest build</span>
             <span>Status</span>
             <span className="text-right">Created / Duration</span>
             <span />
           </div>
           <ul className="divide-y divide-line">
-            {filtered.map((d) => (
-              <DeploymentRow key={d.id} d={d} now={now} />
+            {filtered.map((a) => (
+              <AppRow key={a.repoUrl} app={a} now={now} />
             ))}
           </ul>
         </Card>
@@ -303,8 +350,9 @@ export function DashboardPage() {
 
       {deployments.some((d) => d.status === 'ready') && (
         <p className="mt-4 flex items-center gap-1.5 text-xs text-subtle">
-          <ArrowUpRight className="size-3.5" /> Ready deployments are served by the router at{' '}
-          <code className="font-mono">http://&lt;id&gt;.localhost:3001</code>
+          <ArrowUpRight className="size-3.5" /> Each app has a stable URL{' '}
+          <code className="font-mono">http://&lt;app&gt;.localhost:3001</code> that serves its latest live build; every
+          build also keeps its own <code className="font-mono">&lt;id&gt;</code> URL.
         </p>
       )}
     </>

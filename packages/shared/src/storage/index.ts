@@ -69,6 +69,9 @@ let instance: StorageDriver | null = null;
 
 export async function getStorage(): Promise<StorageDriver> {
   if (instance) return instance;
+  if (config.storage.driver === 's3' && (!config.storage.s3.accessKeyId || !config.storage.s3.secretAccessKey)) {
+    throw new Error('S3_ACCESS_KEY and S3_SECRET_KEY must be set (see .env.example), or use STORAGE_DRIVER=fs.');
+  }
   const driver: StorageDriver =
     config.storage.driver === 'fs' ? new FsStorage(config.storage.fsDir) : new S3Storage(config.storage.s3);
   await driver.init();

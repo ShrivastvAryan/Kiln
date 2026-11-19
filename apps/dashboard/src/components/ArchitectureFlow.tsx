@@ -82,7 +82,7 @@ const NODES: FlowNode[] = [
     x: 930,
     y: 420,
     title: 'Object Storage',
-    subtitle: 'MinIO · S3 · R2',
+    subtitle: 'SeaweedFS · S3 · R2',
     icon: HardDrive,
   },
   {

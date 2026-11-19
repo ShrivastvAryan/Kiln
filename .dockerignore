@@ -1,0 +1,17 @@
+# Keep the build context small and never ship local secrets or data into the image.
+.git
+.data
+.env
+.env.*
+!.env.example
+**/node_modules
+**/.next
+**/dist
+*.log
+.claude
+.vscode
+
+# The dashboard runs on the host (bun dev); only its manifest is needed so `npm ci`
+# can validate the workspace lockfile.
+apps/dashboard/*
+!apps/dashboard/package.json

@@ -4,14 +4,18 @@ import { pipeline } from 'node:stream/promises';
 import {
   ACTIVE_STATUSES,
   config,
+  createRedis,
   getDeployment,
   getStorage,
+  keys,
+  resolveAppSlug,
   storageKeys,
   type StoredObject,
 } from '@deployx/shared';
 import { statusPage } from './pages';
 
 const storage = await getStorage();
+const redis = createRedis('router');
 const SUFFIX = `.${config.rootDomain}`;
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const dashboardUrl = process.env.DASHBOARD_URL ?? 'http://localhost:3000';
@@ -74,8 +78,54 @@ const server = http.createServer(async (req, res) => {
       );
     }
 
-    const id = hostname.slice(0, -SUFFIX.length).split('.').pop()!;
-    if (!ID_RE.test(id)) return html(res, 400, 'Bad host');
+    const label = hostname.slice(0, -SUFFIX.length).split('.').pop()!;
+    if (!ID_RE.test(label)) return html(res, 400, 'Bad host');
+
+    // Build ids never contain "-"; app slugs always do. An app URL serves the app's latest live build.
+    let id = label;
+    if (label.includes('-')) {
+      const target = await resolveAppSlug(redis, label);
+      if (target === undefined) {
+        return html(
+          res,
+          404,
+          statusPage({
+            code: '404 · Not found',
+            title: 'App not found',
+            message: `There is no app at "${label}". It may have been deleted.`,
+            dashboard: `${dashboardUrl}/deployments`,
+          }),
+        );
+      }
+      if (target === null) {
+        return html(
+          res,
+          503,
+          statusPage({
+            code: 'No live build',
+            title: 'This app has no live build yet',
+            message: 'It will appear here as soon as a build finishes. This page refreshes automatically.',
+            refresh: true,
+            dashboard: `${dashboardUrl}/deployments`,
+          }),
+        );
+      }
+      id = target;
+    }
+
+    // Paused by its owner: one Redis lookup per request, no database round trip.
+    if (await redis.exists(keys.paused(id))) {
+      return html(
+        res,
+        503,
+        statusPage({
+          code: 'Paused',
+          title: 'This deployment is paused',
+          message: 'Its owner has paused it for now. It will be back when they resume it.',
+          dashboard: `${dashboardUrl}/deployments/${id}`,
+        }),
+      );
+    }
 
     const url = new URL(req.url ?? '/', 'http://x');
     let found: { key: string; obj: StoredObject } | null = null;
@@ -111,6 +161,18 @@ const server = http.createServer(async (req, res) => {
             title: 'Deployment in progress',
             message: 'This page will refresh automatically when the build finishes.',
             refresh: true,
+            dashboard: `${dashboardUrl}/deployments/${id}`,
+          }),
+        );
+      }
+      if (deployment.status === 'cancelled') {
+        return html(
+          res,
+          410,
+          statusPage({
+            code: 'Stopped',
+            title: 'This deployment was stopped',
+            message: 'It was stopped before it finished building, so there is nothing to serve.',
             dashboard: `${dashboardUrl}/deployments/${id}`,
           }),
         );

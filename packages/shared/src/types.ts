@@ -1,10 +1,12 @@
-/** Lifecycle of a deployment: cloning → queued → building → uploading → ready | failed */
-export type DeploymentStatus = 'cloning' | 'queued' | 'building' | 'uploading' | 'ready' | 'failed';
+/** Lifecycle of a deployment: cloning → queued → building → uploading → ready | failed | cancelled */
+export type DeploymentStatus = 'cloning' | 'queued' | 'building' | 'uploading' | 'ready' | 'failed' | 'cancelled';
 
 export const ACTIVE_STATUSES: DeploymentStatus[] = ['cloning', 'queued', 'building', 'uploading'];
 
 export interface Deployment {
   id: string;
+  /** User who created it (null for deployments made before auth existed). */
+  ownerId?: string;
   repoUrl: string;
   branch: string;
   status: DeploymentStatus;
@@ -28,6 +30,10 @@ export interface Deployment {
   fileCount?: number;
   totalBytes?: number;
   error?: string;
+  /** Set while a ready deployment is paused (not served). */
+  pausedAt?: number;
+  /** Stable URL of the app this build belongs to (serves the app's latest live build). */
+  appUrl?: string;
 }
 
 export type LogStream = 'stdout' | 'stderr' | 'system';
@@ -69,7 +75,7 @@ export interface SystemHealth {
 
 export type PlatformEvent =
   | { type: 'deployment.updated'; deployment: Deployment }
-  | { type: 'deployment.deleted'; id: string };
+  | { type: 'deployment.deleted'; id: string; ownerId?: string };
 
 export interface CreateDeploymentInput {
   repoUrl: string;

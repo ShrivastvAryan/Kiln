@@ -33,10 +33,11 @@ export const config = {
     driver: env('STORAGE_DRIVER', 's3') as 's3' | 'fs',
     fsDir: resolvePath(env('FS_STORAGE_DIR', '.data/storage')),
     s3: {
-      endpoint: env('S3_ENDPOINT', 'http://127.0.0.1:9000'),
+      endpoint: env('S3_ENDPOINT', 'http://127.0.0.1:8333'),
       region: env('S3_REGION', 'us-east-1'),
-      accessKeyId: env('S3_ACCESS_KEY', 'deployx'),
-      secretAccessKey: env('S3_SECRET_KEY', 'deployx-secret'),
+      // No defaults for credentials: they must come from the environment (.env / docker-compose).
+      accessKeyId: env('S3_ACCESS_KEY', ''),
+      secretAccessKey: env('S3_SECRET_KEY', ''),
       bucket: env('S3_BUCKET', 'deployx'),
     },
   },
@@ -49,6 +50,11 @@ export const config = {
     cpus: env('BUILD_CPUS', '1.5'),
   },
 };
+
+/** Stable URL of an app: always serves its latest live build. */
+export function appUrl(slug: string) {
+  return deploymentUrl(slug);
+}
 
 export function deploymentUrl(id: string) {
   const port = config.routerPort === 80 ? '' : `:${config.routerPort}`;

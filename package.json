@@ -10,16 +10,21 @@
     "apps/*"
   ],
   "scripts": {
-    "dev": "concurrently -k -n api,worker,router,web -c cyan,magenta,yellow,green \"npm:dev:api\" \"npm:dev:worker\" \"npm:dev:router\" \"npm:dev:web\"",
+    "dev": "cd apps/dashboard && npm run dev",
+    "dev:all": "concurrently -k -n api,worker,router,web -c cyan,magenta,yellow,green \"npm:dev:api\" \"npm:dev:worker\" \"npm:dev:router\" \"npm:dev:web\"",
     "dev:api": "npm run dev -w @deployx/api",
     "dev:worker": "npm run dev -w @deployx/worker",
     "dev:router": "npm run dev -w @deployx/router",
-    "dev:web": "npm run dev -w @deployx/dashboard",
+    "dev:web": "cd apps/dashboard && npm run dev",
+    "services:up": "docker compose up -d --build",
+    "services:down": "docker compose down",
+    "services:logs": "docker compose logs -f api worker router",
+    "services:rebuild": "docker compose up -d --build --force-recreate api worker router",
+    "infra:up": "docker compose up -d redis seaweedfs",
+    "infra:down": "docker compose stop redis seaweedfs",
     "start": "concurrently -k -n api,worker,router,web -c cyan,magenta,yellow,green \"npm start -w @deployx/api\" \"npm start -w @deployx/worker\" \"npm start -w @deployx/router\" \"npm start -w @deployx/dashboard\"",
     "build": "npm run build -w @deployx/dashboard",
     "typecheck": "tsc -p tsconfig.json --noEmit && npm run typecheck -w @deployx/dashboard",
-    "infra:up": "docker compose up -d",
-    "infra:down": "docker compose down",
     "db:generate": "prisma generate --schema packages/shared/prisma/schema.prisma",
     "db:migrate": "prisma migrate dev --schema packages/shared/prisma/schema.prisma",
     "db:deploy": "prisma migrate deploy --schema packages/shared/prisma/schema.prisma",
@@ -35,5 +40,9 @@
   },
   "engines": {
     "node": ">=20.12"
+  },
+  "dependencies": {
+    "@neon/config": "^1.14.3",
+    "@neon/env": "^2.1.6"
   }
 }

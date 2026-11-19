@@ -10,3 +10,7 @@ dist/
 next-env.d.ts
 *.tsbuildinfo
 .claude/
+.neon
+
+# Private keys (e.g. the GitHub App key)
+*.pem

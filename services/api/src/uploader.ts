@@ -15,6 +15,10 @@ import {
 } from '@deployx/shared';
 
 const IGNORED = new Set(['.git', 'node_modules', '.next', '.cache', '.turbo']);
+
+/** Clones in progress in this process, so Stop can abort them. */
+const clones = new Map<string, AbortController>();
+export const abortClone = (id: string) => clones.get(id)?.abort();
 const MAX_REPO_FILES = 20_000;
 
 /**
@@ -26,6 +30,8 @@ export async function cloneAndEnqueue(redis: Redis, deployment: Deployment) {
   const log = createLogger(redis, id);
   const dir = path.join(config.dataDir, 'clones', id);
   const started = Date.now();
+  const abort = new AbortController();
+  clones.set(id, abort);
 
   try {
     await fs.rm(dir, { recursive: true, force: true });
@@ -34,7 +40,7 @@ export async function cloneAndEnqueue(redis: Redis, deployment: Deployment) {
     await log.system(`Cloning ${repoUrl} (${branch ? `branch: ${branch}` : 'default branch'})`);
     // Minimal environment: simple-git rejects risky vars (EDITOR, GIT_ASKPASS…) from the parent env,
     // and git doesn't need anything else from the host.
-    const git = simpleGit({ timeout: { block: 120_000 } }).env({
+    const git = simpleGit({ timeout: { block: 120_000 }, abort: abort.signal }).env({
       PATH: process.env.PATH ?? '/usr/bin:/bin',
       HOME: process.env.HOME ?? '/tmp',
       ...(process.env.HTTPS_PROXY ? { HTTPS_PROXY: process.env.HTTPS_PROXY } : {}),
@@ -56,6 +62,7 @@ export async function cloneAndEnqueue(redis: Redis, deployment: Deployment) {
     const result = await uploadDirectory(storage, dir, storageKeys.source(id), {
       ignore: (rel) => rel.split('/').some((seg) => IGNORED.has(seg)),
       onProgress: ({ done, total }) => {
+        if (abort.signal.aborted) throw new Error('aborted');
         if (total > MAX_REPO_FILES) throw new Error(`Repository too large (${total} files)`);
         if (done === total || Date.now() - lastReport > 1000) {
           lastReport = Date.now();
@@ -64,23 +71,31 @@ export async function cloneAndEnqueue(redis: Redis, deployment: Deployment) {
       },
     });
 
-    await updateDeployment(redis, id, {
+    // null = stopped meanwhile: don't queue it.
+    const queued = await updateDeployment(redis, id, {
       status: 'queued',
       branch: resolvedBranch,
       commitSha: commit?.hash,
       commitMessage: commit?.message,
       commitAuthor: commit?.author_name,
     });
+    if (!queued) return;
     await redis.lpush(keys.queue, id);
     await log.system(
       `Source uploaded (${result.fileCount} files) in ${((Date.now() - started) / 1000).toFixed(1)}s. Queued for build.`,
     );
   } catch (err) {
+    if (abort.signal.aborted) {
+      // Already marked `cancelled` by the Stop request.
+      await archiveLogs(redis, id).catch(() => {});
+      return;
+    }
     const message = friendlyGitError(err);
     await log.stderr(message);
     await updateDeployment(redis, id, { status: 'failed', error: message, finishedAt: Date.now() });
     await archiveLogs(redis, id).catch((e) => console.error('[api] archiving logs failed', e));
   } finally {
+    clones.delete(id);
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }

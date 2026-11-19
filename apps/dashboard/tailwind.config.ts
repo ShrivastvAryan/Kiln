@@ -103,6 +103,8 @@ const config = {
       addBase({
         ':root': { ...cssVars('dark'), colorScheme: 'dark' },
         ':root[data-theme="light"]': { ...cssVars('light'), colorScheme: 'light' },
+        // Pin the dark palette for one section (e.g. always-dark hero / auth stage), whatever the page theme.
+        '.theme-dark': { ...cssVars('dark'), colorScheme: 'dark' },
       });
     }),
   ],

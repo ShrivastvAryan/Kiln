@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import type { LogLine } from '@deployx/shared/types';
 import { API_URL } from '@/lib/api';
+import { refreshSession } from '@/lib/session';
+import { useSession } from './auth';
 
 /**
  * Streams build logs over SSE. The server replays history first, then pushes live lines;
@@ -16,12 +18,20 @@ export function useLogStream(id: string) {
   const buffer = useRef<LogLine[]>([]);
   const seen = useRef(new Set<number>());
   const frame = useRef<number | null>(null);
+  const streamFor = useRef<string | null>(null);
+  const { token } = useSession();
 
   useEffect(() => {
-    setLines([]);
-    setLoaded(false);
-    buffer.current = [];
-    seen.current = new Set();
+    if (!token) return;
+    // Only start from scratch for a different deployment; a token rotation just reconnects
+    // (the server replays history and lines are de-duplicated by sequence number).
+    if (streamFor.current !== id) {
+      streamFor.current = id;
+      setLines([]);
+      setLoaded(false);
+      buffer.current = [];
+      seen.current = new Set();
+    }
 
     const flush = () => {
       frame.current = null;
@@ -41,9 +51,14 @@ export function useLogStream(id: string) {
       if (frame.current == null) frame.current = requestAnimationFrame(flush);
     };
 
-    const es = new EventSource(`${API_URL}/api/deployments/${id}/logs/stream`);
+    const es = new EventSource(
+      `${API_URL}/api/deployments/${id}/logs/stream?access_token=${encodeURIComponent(token)}`,
+    );
     es.onopen = () => setConnected(true);
-    es.onerror = () => setConnected(false);
+    es.onerror = () => {
+      setConnected(false);
+      if (es.readyState === EventSource.CLOSED) void refreshSession();
+    };
 
     es.addEventListener('history', (e) => {
       const history = JSON.parse((e as MessageEvent).data) as LogLine[];
@@ -68,7 +83,7 @@ export function useLogStream(id: string) {
       es.close();
       if (frame.current != null) cancelAnimationFrame(frame.current);
     };
-  }, [id]);
+  }, [id, token]);
 
   return { lines, connected, loaded };
 }
