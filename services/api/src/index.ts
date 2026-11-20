@@ -6,9 +6,11 @@ import {
   createDeployment,
   createRedis,
   cancelDeployment,
-  deleteDeployment,
+  deleteApp,
   setPaused,
   syncAppAliases,
+  failAbandoned,
+  prisma,
   deploymentUrl,
   getDeployment,
   getLogs,
@@ -138,20 +140,16 @@ for (const [action, paused] of [
   );
 }
 
+// Deleting removes the whole app: every build of it, with its files, logs, server and URL.
 app.delete(
   '/api/deployments/:id',
   wrap(async (req, res) => {
-    const d = await getDeployment(req.params.id, req.auth!.userId);
-    if (!d) return res.status(404).json({ error: 'Deployment not found' });
-    if (ACTIVE_STATUSES.includes(d.status))
-      return res.status(409).json({ error: 'Cannot delete a deployment while it is in progress' });
     const storage = await getStorage();
-    await Promise.all([
-      storage.deletePrefix(storageKeys.source(d.id)),
-      storage.deletePrefix(storageKeys.output(d.id)),
-    ]);
-    await deleteDeployment(redis, d.id, req.auth!.userId);
-    res.status(204).end();
+    const deleted = await deleteApp(redis, req.params.id, req.auth!.userId, (buildId) =>
+      Promise.all([storage.deletePrefix(storageKeys.source(buildId)), storage.deletePrefix(storageKeys.output(buildId))]),
+    );
+    if (!deleted) return res.status(404).json({ error: 'Deployment not found' });
+    res.json({ deleted });
   }),
 );
 
@@ -232,8 +230,24 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+async function failAbandonedClones() {
+  const startedAt = new Date();
+  const rows = await prisma.deployment.findMany({
+    where: { status: 'cloning', createdAt: { lt: startedAt } },
+    select: { id: true },
+  });
+  let n = 0;
+  for (const { id } of rows)
+    if (await failAbandoned(redis, id, ['cloning'], 'Kiln restarted while cloning the repository. Redeploy to try again.')) n++;
+  return n;
+}
+
 await getStorage();
 await hub.start();
+// Clones run inside this process, so any build still "cloning" now was abandoned by the previous API process.
+failAbandonedClones()
+  .then((n) => n && console.log(`[api] failed ${n} clone(s) abandoned by a restart`))
+  .catch((err) => console.error('[api] checking abandoned clones failed', err));
 // Older apps get their stable-URL slug, and every app URL is pointed at its latest live build.
 syncAppAliases(redis)
   .then((n) => console.log(`[api] app URLs synced for ${n} app(s)`))

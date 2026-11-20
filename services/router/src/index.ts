@@ -10,9 +10,11 @@ import {
   keys,
   resolveAppSlug,
   storageKeys,
+  type RuntimeInfo,
   type StoredObject,
 } from '@deployx/shared';
 import { statusPage } from './pages';
+import { proxyRequest, proxyUpgrade, upstream } from './proxy';
 
 const storage = await getStorage();
 const redis = createRedis('router');
@@ -60,11 +62,6 @@ const server = http.createServer(async (req, res) => {
   const hostname = (req.headers.host ?? '').split(':')[0].toLowerCase();
 
   try {
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      res.writeHead(405, { Allow: 'GET, HEAD' }).end();
-      return;
-    }
-
     if (!hostname.endsWith(SUFFIX)) {
       return html(
         res,
@@ -113,8 +110,9 @@ const server = http.createServer(async (req, res) => {
       id = target;
     }
 
-    // Paused by its owner: one Redis lookup per request, no database round trip.
-    if (await redis.exists(keys.paused(id))) {
+    // Paused flag and server record in one Redis round trip, no database lookup.
+    const [paused, runtimeRaw] = await redis.mget(keys.paused(id), keys.runtime(id));
+    if (paused) {
       return html(
         res,
         503,
@@ -125,6 +123,36 @@ const server = http.createServer(async (req, res) => {
           dashboard: `${dashboardUrl}/deployments/${id}`,
         }),
       );
+    }
+
+    // A server app (Next.js with API routes, Node apps): forward everything to its container.
+    if (runtimeRaw) {
+      const target = upstream(JSON.parse(runtimeRaw) as RuntimeInfo);
+      if (target) {
+        try {
+          await proxyRequest(req, res, target, id);
+        } catch (err) {
+          if (res.headersSent) return void res.destroy();
+          console.error(`[router] upstream ${id}:`, (err as Error).message);
+          return html(
+            res,
+            502,
+            statusPage({
+              code: '502 · App not responding',
+              title: 'This app is not responding',
+              message: 'Its server is restarting or has crashed. This page refreshes automatically.',
+              refresh: true,
+              dashboard: `${dashboardUrl}/deployments/${id}`,
+            }),
+          );
+        }
+        return;
+      }
+    }
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { Allow: 'GET, HEAD' }).end();
+      return;
     }
 
     const url = new URL(req.url ?? '/', 'http://x');
@@ -174,6 +202,20 @@ const server = http.createServer(async (req, res) => {
             title: 'This deployment was stopped',
             message: 'It was stopped before it finished building, so there is nothing to serve.',
             dashboard: `${dashboardUrl}/deployments/${id}`,
+          }),
+        );
+      }
+      if (deployment.status === 'ready' && deployment.framework?.endsWith('(server)')) {
+        // A server build that is no longer the app's live build: its container was stopped.
+        return html(
+          res,
+          410,
+          statusPage({
+            code: 'Not running',
+            title: 'This build is no longer running',
+            message: 'Only the latest live build of an app keeps its server running. Open the app URL for the current one.',
+            dashboard: deployment.appUrl ?? `${dashboardUrl}/deployments/${id}`,
+            ...(deployment.appUrl && { linkLabel: 'Open the live app' }),
           }),
         );
       }
@@ -229,6 +271,24 @@ const server = http.createServer(async (req, res) => {
   } finally {
     const ms = (performance.now() - started).toFixed(1);
     console.log(`[router] ${res.statusCode} ${hostname}${req.url} ${ms}ms`);
+  }
+});
+
+// WebSockets to server apps. Static builds have nothing to upgrade to.
+server.on('upgrade', async (req, socket, head) => {
+  try {
+    const hostname = (req.headers.host ?? '').split(':')[0].toLowerCase();
+    if (!hostname.endsWith(SUFFIX)) return void socket.destroy();
+    const label = hostname.slice(0, -SUFFIX.length).split('.').pop()!;
+    if (!ID_RE.test(label)) return void socket.destroy();
+    const id = label.includes('-') ? await resolveAppSlug(redis, label) : label;
+    if (!id) return void socket.destroy();
+    const [paused, runtimeRaw] = await redis.mget(keys.paused(id), keys.runtime(id));
+    const target = !paused && runtimeRaw ? upstream(JSON.parse(runtimeRaw) as RuntimeInfo) : null;
+    if (!target) return void socket.destroy();
+    proxyUpgrade(req, socket, head, target);
+  } catch {
+    socket.destroy();
   }
 });
 

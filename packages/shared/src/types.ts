@@ -36,6 +36,15 @@ export interface Deployment {
   appUrl?: string;
 }
 
+/** Where a running server build can be reached (stored in Redis under keys.runtime(id)). */
+export interface RuntimeInfo {
+  container: string;
+  /** Port the app listens on inside its container. */
+  port: number;
+  /** Port published on the host's 127.0.0.1, for a router that runs outside Docker. */
+  hostPort?: number;
+}
+
 export type LogStream = 'stdout' | 'stderr' | 'system';
 
 export interface LogLine {

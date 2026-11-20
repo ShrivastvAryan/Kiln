@@ -5,7 +5,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { Hand, Trash2 } from 'lucide-react';
 import type { Deployment } from '@deployx/shared/types';
 import PaperCrumple, { type PaperCrumpleState } from '@/components/react-bits/PaperCrumple';
-import { displayUrl } from '@/lib/format';
+import { displayUrl, repoName } from '@/lib/format';
 import { RECEIPT, RECEIPT_PAPER, hashString, makeReceipt } from '@/lib/receipt';
 import { Button } from './ui';
 
@@ -24,12 +24,15 @@ type Phase = 'idle' | 'holding' | 'tossing';
 export function CrumpleDeleteDialog({
   open,
   deployment: d,
+  buildCount,
   busy,
   onClose,
   onConfirm,
 }: {
   open: boolean;
   deployment: Deployment;
+  /** How many builds the app has: all of them are deleted. */
+  buildCount: number;
   busy: boolean;
   onClose: () => void;
   onConfirm: () => void | Promise<void>;
@@ -110,11 +113,12 @@ export function CrumpleDeleteDialog({
           >
             <div className="px-6 pt-6">
               <h2 id="crumple-title" className="text-base font-semibold">
-                Delete this deployment?
+                Delete {repoName(d.repoUrl)}?
               </h2>
               <p id="crumple-desc" className="mt-2 text-sm text-muted">
-                <span className="font-mono text-fg">{displayUrl(d.url)}</span> will stop serving immediately and its
-                source, build output and logs will be permanently removed.
+                <span className="font-mono text-fg">{displayUrl(d.appUrl ?? d.url)}</span> stops serving immediately.
+                All {buildCount === 1 ? 'of its 1 build' : `${buildCount} builds`}, with their source, output, logs and
+                servers, are permanently removed. Builds still running are stopped first.
               </p>
             </div>
 
@@ -198,7 +202,7 @@ export function CrumpleDeleteDialog({
                 disabled={tossing}
                 icon={<Trash2 className="size-4" />}
               >
-                {paperFailed ? 'Delete deployment' : 'Just delete'}
+                {paperFailed ? 'Delete app' : 'Just delete'}
               </Button>
             </div>
           </motion.div>

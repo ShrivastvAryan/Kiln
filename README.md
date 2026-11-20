@@ -33,8 +33,14 @@ log line to the browser in real time, and serves the result on its own wildcard 
   horizontally by starting more processes.
 - **Sandboxed builds:** each build runs in an ephemeral `node:22-alpine` container with memory, CPU and PID limits,
   `no-new-privileges` and a timeout.
-- **Zero-config detection:** Vite, CRA, Next.js (export), Astro, SvelteKit, Gatsby, Docusaurus, Angular and plain
+- **Zero-config detection:** Vite, CRA, Next.js, Astro, SvelteKit, Gatsby, Docusaurus, Angular and plain
   static HTML; npm, pnpm, yarn and bun lockfiles.
+- **Node server apps:** when a build leaves no static site (Next.js with API routes, SSR or ISR, or a Node app with a
+  `start` script), Kiln keeps the built folder and runs it as a long-lived container (`next start` / `npm start`)
+  with memory, CPU and PID limits, dropped capabilities and `--restart unless-stopped`. The deploy goes live only once
+  the server answers HTTP. The router proxies every method and WebSocket upgrades to it. App containers sit on their
+  own `kiln-apps` network, shared only with the router, so they can't reach Redis, storage or the API. Only each
+  app's live build keeps running: a reconcile loop in the worker stops superseded and deleted builds.
 - **Real-time logs:** every stdout and stderr line is written to a Redis list (for replay) and published over
   pub/sub, then fanned out to browsers over Server-Sent Events by a single subscriber connection.
 - **Wildcard subdomain router:** maps `Host` to a deployment id and then to an object key. Supports clean URLs, SPA
@@ -140,6 +146,7 @@ projects ──< deployments ──< build_logs
 | **PostgreSQL** | projects, deployments, archived build logs | relational, queryable (stats via `GROUP BY`), transactional status changes |
 | **Redis** | job queue, live log buffer and pub/sub, worker heartbeats | fast and short-lived; the log buffer expires 1h after archiving |
 | **Object storage** | `source/<id>/`, `dist/<id>/` | static files served by the router |
+| **Disk + Docker** | `<DATA_DIR>/apps/<id>/`, container `kiln-app-<id>` | built server apps (with `node_modules`) and the container running each live one |
 
 The schema is in [`packages/shared/prisma/schema.prisma`](packages/shared/prisma/schema.prisma).
 
@@ -203,4 +210,5 @@ Google sign-in is optional: create a Web OAuth client with redirect URI
 - GitHub webhooks for deploy-on-push, plus preview deployments per PR
 - Custom domains and project aliases (`project.localhost` pointing at the latest ready deployment)
 - Build cache for `node_modules` keyed by lockfile hash
-- Server-side rendering runtimes (containers kept warm by the router)
+- Environment variables per app (build time and runtime)
+- Scale idle server apps to zero and wake them on the first request

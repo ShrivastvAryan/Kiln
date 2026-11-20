@@ -18,7 +18,10 @@ import {
   type WorkerInfo,
 } from '@deployx/shared';
 import { detectBuildPlan, resolveOutputDir } from './detect';
+import { publishFilter } from './publish';
 import { CancelledError, runCommand } from './runner';
+import { recoverAbandoned } from './recovery';
+import { appDir, appsDir, reconcile, removeApp, startServer } from './runtime';
 
 const redis = createRedis('worker');
 const processId = `${os.hostname()}-${process.pid}`;
@@ -27,8 +30,20 @@ let shuttingDown = false;
 /** Builds running in this process, so a "stop" from the console can abort them. */
 const running = new Map<string, AbortController>();
 const cancelSub = createRedis('worker-cancel');
-cancelSub.on('ready', () => void cancelSub.subscribe(keys.cancel));
-cancelSub.on('message', (_channel, id: string) => running.get(id)?.abort());
+cancelSub.on('ready', () => void cancelSub.subscribe(keys.cancel, keys.events));
+cancelSub.on('message', (channel, message: string) => {
+  if (channel === keys.cancel) return void running.get(message)?.abort();
+  // A build went live or was deleted: stop server containers that should no longer run.
+  try {
+    const event = JSON.parse(message) as { type: string; deployment?: { status: string } };
+    if (event.type === 'deployment.deleted' || event.deployment?.status === 'ready') void reconcileApps();
+  } catch {
+    /* not JSON */
+  }
+});
+
+/** Server builds this process is still starting are left alone by the reconcile loop. */
+const reconcileApps = () => reconcile(redis, () => new Set(running.keys()));
 
 /** Serialises log writes so lines keep their order even when stdout/stderr interleave. */
 function orderedLogger(r: Redis, id: string) {
@@ -71,6 +86,13 @@ async function claimWithRetry(id: string, workerId: string) {
   }
 }
 
+async function pathExists(p: string) {
+  return fs.access(p).then(
+    () => true,
+    () => false,
+  );
+}
+
 async function build(id: string, workerId: string) {
   // Atomic queued → building transition in Postgres: a job can only ever be built once.
   const deployment = await claimWithRetry(id, workerId);
@@ -85,6 +107,9 @@ async function build(id: string, workerId: string) {
   const checkpoint = () => {
     if (abort.signal.aborted) throw new CancelledError();
   };
+
+  /** Set once the build folder becomes a server app's home: removed again if the deploy doesn't go live. */
+  let serverDir: string | null = null;
 
   await log.system(`Build started on ${workerId} (isolation: ${config.worker.isolation})`);
 
@@ -125,13 +150,51 @@ async function build(id: string, workerId: string) {
 
     checkpoint();
 
-    // 4. Locate output
-    const outputDir = await resolveOutputDir(dir, deployment.outputDir ?? plan.outputDir);
+    // 4. Static site or Node server? A static export / built site wins; otherwise run the app's server.
+    const isNext = plan.framework.startsWith('Next.js');
+    let outputDir: string | null = null;
+    if (deployment.outputDir) outputDir = await resolveOutputDir(dir, deployment.outputDir);
+    else if (isNext) outputDir = (await pathExists(path.join(dir, 'out', 'index.html'))) ? 'out' : null;
+    // A Node app with a "start" script and nothing to build is a server (Express, Fastify…), not a site.
+    else if (!(plan.startCommand && !buildCommand)) outputDir = await resolveOutputDir(dir, plan.outputDir);
+
+    const server = !outputDir && !deployment.outputDir ? plan.startCommand : undefined;
+    if (server) {
+      if (config.worker.isolation !== 'docker')
+        throw new Error('This is a server app. Running server apps needs BUILD_ISOLATION=docker.');
+      await log.system(`No static site in the build output: running it as a Node server (${server.framework})`);
+      await updateDeployment(redis, id, { framework: server.framework, outputDir: isNext ? '.next' : '.' });
+      checkpoint();
+
+      // Keep the built folder (with node_modules) as the app's home and run it in its own container.
+      serverDir = appDir(id);
+      await fs.rm(serverDir, { recursive: true, force: true });
+      await fs.mkdir(appsDir, { recursive: true });
+      await fs.rename(dir, serverDir);
+      await log.system(`$ ${server.command}`);
+      await startServer({ redis, id, command: server.command, signal: abort.signal, log: (l) => log.stdout(l) });
+      checkpoint();
+
+      const finishedAt = Date.now();
+      await log.system(`✓ Server is up. Deployment ready in ${((finishedAt - started) / 1000).toFixed(1)}s → ${deployment.url}`);
+      await log.flush();
+      const updated = await updateDeployment(redis, id, {
+        status: 'ready',
+        finishedAt,
+        buildDurationMs: finishedAt - started,
+      });
+      if (!updated) await removeApp(redis, id); // stopped or deleted while starting
+      else void reconcileApps(); // the app's previous live build stops serving
+      return;
+    }
+
     if (!outputDir) {
       throw new Error(
         deployment.outputDir
           ? `Output directory "${deployment.outputDir}" does not exist after build`
-          : 'Could not find build output (looked for dist/, build/, out/, public/ with an index.html). Set the output directory manually.',
+          : plan.serverApp
+            ? `This looks like a ${plan.serverApp} app with no static site to serve. Kiln runs static sites and Node.js apps, so it can't run this server code.`
+            : 'Could not find an index.html in the repository root or in dist/, build/, out/, public/ or _site/. Set the output directory manually.',
       );
     }
     const outPath = path.join(dir, outputDir);
@@ -142,7 +205,7 @@ async function build(id: string, workerId: string) {
     await updateDeployment(redis, id, { status: 'uploading', outputDir });
     let lastReport = 0;
     const { fileCount, totalBytes } = await uploadDirectory(storage, outPath, storageKeys.output(id), {
-      ignore: (rel) => rel.split('/').some((s) => s === 'node_modules' || s === '.git'),
+      ignore: publishFilter(outputDir),
       onProgress: ({ done, total }) => {
         checkpoint(); // abort the upload between files
         if (done === total || Date.now() - lastReport > 750) {
@@ -164,6 +227,7 @@ async function build(id: string, workerId: string) {
       totalBytes,
     });
   } catch (err) {
+    if (serverDir) await removeApp(redis, id);
     if (err instanceof CancelledError) {
       // Status is already `cancelled` (set by the API). Drop any half-uploaded output so it's never served.
       await log.system('Build process stopped.');
@@ -241,6 +305,15 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
 }
 
 await getStorage();
+// Fail builds whose worker died mid-way (e.g. this one, before a restart) and re-queue lost jobs.
+const recover = () =>
+  recoverAbandoned(redis, (id) => running.has(id)).catch((err) => console.error('[recovery] sweep failed', err));
+setTimeout(() => void recover(), 12_000).unref(); // after a dead worker's heartbeat key (10 s) has expired
+setInterval(() => void recover(), 30_000).unref();
+if (config.worker.isolation === 'docker') {
+  void reconcileApps();
+  setInterval(() => void reconcileApps(), 30_000).unref();
+}
 console.log(
   `[worker] ${processId} started: ${config.worker.concurrency} slot(s), isolation=${config.worker.isolation}, storage=${config.storage.driver}`,
 );

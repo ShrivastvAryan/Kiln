@@ -7,13 +7,13 @@ export function contentTypeFor(file: string) {
 }
 
 /** Recursively list files under a directory (relative POSIX paths). */
-export async function walk(dir: string, ignore: (rel: string) => boolean = () => false) {
+export async function walk(dir: string, ignore: (rel: string, isDir: boolean) => boolean = () => false) {
   const out: string[] = [];
   async function recurse(current: string) {
     for (const entry of await fs.readdir(current, { withFileTypes: true })) {
       const abs = path.join(current, entry.name);
       const rel = path.relative(dir, abs).split(path.sep).join('/');
-      if (ignore(rel)) continue;
+      if (ignore(rel, entry.isDirectory())) continue;
       if (entry.isDirectory()) await recurse(abs);
       else if (entry.isFile()) out.push(rel);
     }

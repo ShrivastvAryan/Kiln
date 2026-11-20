@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { APP_PORT } from './runtime';
 
 export interface BuildPlan {
   framework: string;
@@ -8,10 +9,17 @@ export interface BuildPlan {
   buildCommand: string | null;
   /** Explicit output dir; when null, it's discovered after the build. */
   outputDir: string | null;
+  /** Set when the repo looks like a server app (Django, Go, …) that a static host can't run. */
+  serverApp?: string;
+  /**
+   * How to run the app as a Node server when the build leaves no static site behind
+   * (Next.js without `output: 'export'`, or any app with a "start" script).
+   */
+  startCommand?: { command: string; framework: string };
 }
 
 const FRAMEWORKS: { dep: string; name: string; output: string }[] = [
-  { dep: 'next', name: 'Next.js (static export)', output: 'out' },
+  { dep: 'next', name: 'Next.js', output: 'out' },
   { dep: 'astro', name: 'Astro', output: 'dist' },
   { dep: '@sveltejs/kit', name: 'SvelteKit (static)', output: 'build' },
   { dep: 'gatsby', name: 'Gatsby', output: 'public' },
@@ -33,10 +41,38 @@ async function exists(p: string) {
   }
 }
 
+/** Marker files of server-side apps, checked in order. */
+const SERVER_APPS: { file: string; name: string }[] = [
+  { file: 'manage.py', name: 'Django (Python)' },
+  { file: 'pyproject.toml', name: 'Python' },
+  { file: 'requirements.txt', name: 'Python' },
+  { file: 'Pipfile', name: 'Python' },
+  { file: 'go.mod', name: 'Go' },
+  { file: 'Cargo.toml', name: 'Rust' },
+  { file: 'Gemfile', name: 'Ruby' },
+  { file: 'composer.json', name: 'PHP' },
+  { file: 'pom.xml', name: 'Java (Maven)' },
+  { file: 'build.gradle', name: 'Java (Gradle)' },
+];
+
+async function detectServerApp(dir: string) {
+  for (const s of SERVER_APPS) if (await exists(path.join(dir, s.file))) return s.name;
+  return undefined;
+}
+
 export async function detectBuildPlan(dir: string): Promise<BuildPlan> {
   const pkgPath = path.join(dir, 'package.json');
   if (!(await exists(pkgPath))) {
-    return { framework: 'Static HTML', packageManager: 'none', installCommand: null, buildCommand: null, outputDir: '.' };
+    const serverApp = await detectServerApp(dir);
+    return {
+      framework: serverApp ?? 'Static HTML',
+      packageManager: 'none',
+      installCommand: null,
+      buildCommand: null,
+      // Discovered after the "build": the folder must actually contain an index.html.
+      outputDir: null,
+      serverApp,
+    };
   }
 
   const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf8')) as {
@@ -70,12 +106,20 @@ export async function detectBuildPlan(dir: string): Promise<BuildPlan> {
     none: 'npm run',
   }[packageManager];
 
+  const isNext = fw?.dep === 'next';
+  const startCommand = isNext
+    ? { command: `node_modules/.bin/next start -p ${APP_PORT} -H 0.0.0.0`, framework: 'Next.js (server)' }
+    : pkg.scripts?.start
+      ? { command: `${run} start`, framework: `${fw?.name ?? 'Node.js'} (server)` }
+      : undefined;
+
   return {
     framework: fw?.name ?? 'Node.js',
     packageManager,
     installCommand,
     buildCommand: pkg.scripts?.build ? `${run} build` : null,
     outputDir: null,
+    startCommand,
   };
 }
 

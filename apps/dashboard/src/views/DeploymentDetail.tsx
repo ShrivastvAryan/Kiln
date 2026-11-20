@@ -27,7 +27,7 @@ import { ACTIVE_STATUSES, type Deployment, type DeploymentStatus } from '@deploy
 import CursorGrid from '@/components/react-bits/CursorGrid';
 import { LogConsole } from '@/components/LogConsole';
 import dynamic from 'next/dynamic';
-import { DeployDialog } from '@/components/DeployDialog';
+import { DeploySteps } from '@/components/DeploySteps';
 import { Button, Card, CopyButton, Dialog, GitHubIcon, StatusBadge, useToast } from '@/components/ui';
 import { useDeployments } from '@/hooks/deployments';
 import { useNow } from '@/hooks/misc';
@@ -256,14 +256,14 @@ function BuildHistory({ current, builds }: { current: Deployment; builds: Deploy
 export function DeploymentDetailPage({ id }: { id: string }) {
   const router = useRouter();
   const toast = useToast();
-  const { byId, upsert, loading, deployments } = useDeployments();
+  const { byId, upsert, remove: removeLocal, loading, deployments } = useDeployments();
   const [fetched, setFetched] = useState<Deployment | null | undefined>(undefined);
   const [confirmDelete, setConfirmDelete] = useState(false);
   // Mount (and download) the 3D delete dialog only once Delete has been clicked.
   const [deleteUsed, setDeleteUsed] = useState(false);
   const [busy, setBusy] = useState<'delete' | 'stop' | 'pause' | null>(null);
   const [confirmStop, setConfirmStop] = useState(false);
-  const [redeployOpen, setRedeployOpen] = useState(false);
+  const [redeploying, setRedeploying] = useState(false);
   const deployment = byId.get(id) ?? fetched ?? null;
   const active = !!deployment && ACTIVE_STATUSES.includes(deployment.status);
   const now = useNow(1000, active);
@@ -307,11 +307,17 @@ export function DeploymentDetailPage({ id }: { id: string }) {
   const isAppLive = appLive?.id === d.id;
   const elapsed = active ? now - (d.startedAt ?? d.createdAt) : d.buildDurationMs;
 
-  /** Starts the redeploy (run by the deploy dialog, which shows any error). */
+  /** Starts a new build of this app and opens it; its page follows the build live. */
   const redeploy = async () => {
-    const next = await api.redeploy(d.id);
-    upsert(next);
-    return next;
+    setRedeploying(true);
+    try {
+      const next = await api.redeploy(d.id);
+      upsert(next);
+      router.push(`/deployments/${next.id}`);
+    } catch (e) {
+      toast({ tone: 'error', title: 'Could not redeploy', description: (e as Error).message });
+      setRedeploying(false);
+    }
   };
 
 
@@ -348,9 +354,16 @@ export function DeploymentDetailPage({ id }: { id: string }) {
   const remove = async () => {
     setBusy('delete');
     try {
-      await api.deleteDeployment(d.id);
-      toast({ tone: 'success', title: 'Deployment deleted', description: `${d.id} and its assets were removed.` });
+      const { deleted } = await api.deleteDeployment(d.id);
+      toast({
+        tone: 'success',
+        title: 'App deleted',
+        description: `${repoName(d.repoUrl)} and ${deleted.length === 1 ? 'its build were' : `all ${deleted.length} builds were`} removed.`,
+      });
       router.push('/deployments');
+      // The live event stream removes them too; don't wait for it (but leave this page first, or it
+      // would flash "not found").
+      window.setTimeout(() => deleted.forEach(removeLocal), 0);
     } catch (e) {
       toast({ tone: 'error', title: 'Delete failed', description: (e as Error).message });
       setBusy(null);
@@ -394,8 +407,7 @@ export function DeploymentDetailPage({ id }: { id: string }) {
               setDeleteUsed(true);
               setConfirmDelete(true);
             }}
-            disabled={active}
-            title={active ? 'Wait for the build to finish' : undefined}
+            title="Delete this app and all its builds"
           >
             Delete
           </Button>
@@ -410,7 +422,7 @@ export function DeploymentDetailPage({ id }: { id: string }) {
               Stop
             </Button>
           ) : (
-            <Button icon={<RotateCw className="size-4" />} onClick={() => setRedeployOpen(true)} loading={redeployOpen}>
+            <Button icon={<RotateCw className="size-4" />} onClick={redeploy} loading={redeploying}>
               Redeploy
             </Button>
           )}
@@ -511,7 +523,14 @@ export function DeploymentDetailPage({ id }: { id: string }) {
                 )}
               </Detail>
               <Detail icon={FileStack} label="Output">
-                {d.fileCount != null ? (
+                {d.framework?.endsWith('(server)') ? (
+                  <>
+                    Node server
+                    {d.outputDir && d.outputDir !== '.' && (
+                      <span className="font-mono text-xs text-muted"> ({d.outputDir}/)</span>
+                    )}
+                  </>
+                ) : d.fileCount != null ? (
                   <>
                     {d.fileCount} files · {formatBytes(d.totalBytes)}
                     {d.outputDir && d.outputDir !== '.' && (
@@ -531,6 +550,12 @@ export function DeploymentDetailPage({ id }: { id: string }) {
             </dl>
           </div>
         </div>
+        {/* Live progress while it builds; stays after a failure or stop to show where it ended. */}
+        {d.status !== 'ready' && (
+          <div className="border-t border-line px-4 py-5 sm:px-6">
+            <DeploySteps d={d} />
+          </div>
+        )}
       </Card>
 
       {d.status === 'ready' && d.pausedAt && (
@@ -582,16 +607,6 @@ export function DeploymentDetailPage({ id }: { id: string }) {
         filename={`kiln-${d.id}.log`}
       />
 
-      <DeployDialog
-        open={redeployOpen}
-        title={`Redeploying ${repoName(d.repoUrl)}`}
-        run={redeploy}
-        redeployOf={d.id}
-        onClose={(next) => {
-          setRedeployOpen(false);
-          if (next) router.push(`/deployments/${next.id}`);
-        }}
-      />
 
       <Dialog
         open={confirmStop}
@@ -610,6 +625,7 @@ export function DeploymentDetailPage({ id }: { id: string }) {
       {deleteUsed && <CrumpleDeleteDialog
         open={confirmDelete}
         deployment={d}
+        buildCount={builds.length}
         busy={busy === 'delete'}
         onClose={() => setConfirmDelete(false)}
         onConfirm={remove}

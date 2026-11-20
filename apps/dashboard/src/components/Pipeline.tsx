@@ -1,6 +1,6 @@
 'use client';
 
-/** Deployment pipeline steps (Clone → Queue → Build → Upload → Live), shown live in the deploy dialog. */
+/** Deployment pipeline steps (Clone → Queue → Build → Upload → Live), shown live on the build page. */
 
 import { GitBranch, Hammer, Inbox, Rocket, UploadCloud, type LucideIcon } from 'lucide-react';
 import type { Deployment, DeploymentStatus } from '@deployx/shared/types';

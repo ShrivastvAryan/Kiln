@@ -113,6 +113,10 @@ services:
       <<: *kiln-env
       BUILD_ISOLATION: docker
       BUILD_IMAGE: node:22-alpine
+      BUILD_MEMORY: 16g
+      # Server apps (Next.js with API routes, Node apps) run as containers on the kiln-apps network.
+      RUNTIME_NETWORK: kiln-apps
+      RUNTIME_MEMORY: ${RUNTIME_MEMORY:-1g}
       WORKER_CONCURRENCY: 2
       DATA_DIR: ${PWD}/.data/docker
     volumes:
@@ -121,12 +125,23 @@ services:
     depends_on: *kiln-deps
 
   # Wildcard subdomain router: http://<id>.localhost:3001
+  # Server apps are proxied by container name over kiln-apps. App containers join only that network, so
+  # untrusted app code can reach the router but not Redis, storage or the API on the default network.
   router:
     <<: *kiln
     command: ["npm", "start", "-w", "@deployx/router"]
+    environment:
+      <<: *kiln-env
+      RUNTIME_UPSTREAM: container
     ports:
       - "3001:3001"
+    networks: [default, apps]
     depends_on: *kiln-deps
+
+networks:
+  default:
+  apps:
+    name: kiln-apps
 
 volumes:
   redis-data:

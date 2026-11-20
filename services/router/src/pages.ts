@@ -1,7 +1,7 @@
 const esc = (s: string) => s.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 /** Small branded status pages served when a deployment can't be shown. */
-export function statusPage(opts: { title: string; message: string; code: string; refresh?: boolean; dashboard: string }) {
+export function statusPage(opts: { title: string; message: string; code: string; refresh?: boolean; dashboard: string; linkLabel?: string }) {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -15,7 +15,14 @@ ${opts.refresh ? '<meta http-equiv="refresh" content="3" />' : ''}
   body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 16px;
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
     background: radial-gradient(1200px 600px at 50% -10%, #431407 0%, #0c0a09 60%); color: #f5f5f4; }
-  .card { max-width: 440px; width: 100%; text-align: center; padding: 40px 28px; border-radius: 16px;
+  /* Same grid as the console's .bg-grid: 32px cells fading out from the top. */
+  body::before { content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background-image: linear-gradient(to right, #292524 1px, transparent 1px),
+      linear-gradient(to bottom, #292524 1px, transparent 1px);
+    background-size: 32px 32px;
+    -webkit-mask-image: radial-gradient(ellipse at top, #000 20%, transparent 70%);
+    mask-image: radial-gradient(ellipse at top, #000 20%, transparent 70%); }
+  .card { position: relative; z-index: 1; max-width: 440px; width: 100%; text-align: center; padding: 40px 28px; border-radius: 16px;
     border: 1px solid #292524; background: rgba(28,25,23,.7); backdrop-filter: blur(8px); }
   .code { font: 600 12px ui-monospace, monospace; letter-spacing: .12em; color: #fb923c; text-transform: uppercase; }
   h1 { font-size: 22px; margin: 12px 0 8px; }
@@ -33,7 +40,7 @@ ${opts.refresh ? '<meta http-equiv="refresh" content="3" />' : ''}
     <div class="code">${esc(opts.code)}</div>
     <h1>${esc(opts.title)}</h1>
     <p>${esc(opts.message)}</p>
-    <a href="${esc(opts.dashboard)}">Open Kiln console</a>
+    <a href="${esc(opts.dashboard)}">${esc(opts.linkLabel ?? 'Open Kiln console')}</a>
   </main>
 </body>
 </html>`;

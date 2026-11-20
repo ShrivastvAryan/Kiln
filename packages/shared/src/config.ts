@@ -45,9 +45,22 @@ export const config = {
     concurrency: num('WORKER_CONCURRENCY', 2),
     isolation: env('BUILD_ISOLATION', 'docker') as 'docker' | 'local',
     image: env('BUILD_IMAGE', 'node:22-alpine'),
-    timeoutMs: num('BUILD_TIMEOUT_MS', 10 * 60 * 1000),
-    memory: env('BUILD_MEMORY', '1g'),
-    cpus: env('BUILD_CPUS', '1.5'),
+    // Sized for modern framework builds (Next.js type-checks and bundles in one process); Vercel uses 8 GB.
+    timeoutMs: num('BUILD_TIMEOUT_MS', 20 * 60 * 1000),
+    memory: env('BUILD_MEMORY', '4g'),
+    cpus: env('BUILD_CPUS', '4'),
+  },
+  /** Server apps (e.g. Next.js with API routes) run as long-lived containers that the router proxies to. */
+  runtime: {
+    memory: env('RUNTIME_MEMORY', '1g'),
+    cpus: env('RUNTIME_CPUS', '1'),
+    /** Docker network app containers join. Only the router should share it (not Redis, storage or the API). */
+    network: env('RUNTIME_NETWORK', ''),
+    /**
+     * How the router reaches an app: "container" = by container name on RUNTIME_NETWORK (router in Docker),
+     * "host" = through the port published on 127.0.0.1 (router running on the host).
+     */
+    upstream: env('RUNTIME_UPSTREAM', 'host') as 'container' | 'host',
   },
 };
 

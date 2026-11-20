@@ -10,8 +10,7 @@ import { Button, Card, Field, Input, useToast } from '@/components/ui';
 import { useDeployments } from '@/hooks/deployments';
 import { useGitHubStatus } from '@/hooks/github';
 import { ApiError, api, type GitHubRepo } from '@/lib/api';
-import { DeployDialog } from '@/components/DeployDialog';
-import { cn, repoName } from '@/lib/format';
+import { cn } from '@/lib/format';
 
 const EXAMPLES = [
   { name: 'Static HTML', repo: 'https://github.com/mdn/beginner-html-site-styled' },
@@ -82,21 +81,24 @@ export function NewDeploymentPage() {
     if (githubResult !== 'installed') router.replace('/new');
   }, [githubResult]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const [deployOpen, setDeployOpen] = useState(false);
+  const [deploying, setDeploying] = useState(false);
 
-  /** Creates the deployment (run by the deploy dialog). Field errors are marked on the form too. */
+  /** Creates the deployment and opens its page, which follows the build live. Field errors go on the form. */
   const deploy = async () => {
+    setDeploying(true);
     try {
       const d = await api.createDeployment({ repoUrl, branch, installCommand, buildCommand, outputDir });
       upsert(d);
-      return d;
+      router.push(`/deployments/${d.id}`);
     } catch (err) {
       const e = err as ApiError;
       if (e.field) {
         setErrors({ [e.field]: e.message });
         if (e.field !== 'repoUrl') setAdvanced(true);
+      } else {
+        toast({ tone: 'error', title: 'Could not start the deployment', description: e.message });
       }
-      throw err;
+      setDeploying(false);
     }
   };
 
@@ -108,7 +110,7 @@ export function NewDeploymentPage() {
       repoRef.current?.focus();
       return;
     }
-    setDeployOpen(true);
+    void deploy();
   };
 
   const form = (
@@ -239,7 +241,7 @@ export function NewDeploymentPage() {
           type="submit"
           variant="primary"
           className="flex-1"
-          loading={deployOpen}
+          loading={deploying}
           icon={<Rocket className="size-4" />}
         >
           {picked ? `Deploy ${picked.name}` : 'Deploy'}
@@ -341,15 +343,6 @@ export function NewDeploymentPage() {
         </ol>
       </section>
 
-      <DeployDialog
-        open={deployOpen}
-        title={`Deploying ${repoName(repoUrl) || 'repository'}`}
-        run={deploy}
-        onClose={(d) => {
-          setDeployOpen(false);
-          if (d) router.push(`/deployments/${d.id}`);
-        }}
-      />
     </>
   );
 }

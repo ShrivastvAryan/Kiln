@@ -278,6 +278,31 @@ export async function cancelDeployment(redis: Redis, id: string) {
   return deployment;
 }
 
+/**
+ * Fails a build nobody is working on any more (its worker or the API process died mid-way). Only applies if
+ * the build is still in one of `from`, so it can't overwrite a build that finished or was stopped meanwhile.
+ * Returns true if it was failed.
+ */
+export async function failAbandoned(redis: Redis, id: string, from: DeploymentStatus[], message: string) {
+  const now = new Date();
+  const row = await prisma.deployment.findUnique({ where: { id }, select: { startedAt: true } });
+  const { count } = await prisma.deployment.updateMany({
+    where: { id, status: { in: from } },
+    data: {
+      status: 'failed',
+      error: message,
+      finishedAt: now,
+      ...(row?.startedAt && { buildDurationMs: now.getTime() - row.startedAt.getTime() }),
+    },
+  });
+  if (count === 0) return false;
+  await appendLog(redis, id, 'stderr', `✗ ${message}`);
+  await archiveLogs(redis, id).catch(() => {});
+  const deployment = await getDeployment(id);
+  if (deployment) await publish(redis, { type: 'deployment.updated', deployment });
+  return true;
+}
+
 /** Pause (stop serving) or resume a ready deployment. Returns null unless it is ready. */
 export async function setPaused(redis: Redis, id: string, paused: boolean) {
   const { count } = await prisma.deployment.updateMany({
@@ -295,10 +320,45 @@ export async function setPaused(redis: Redis, id: string, paused: boolean) {
 
 export async function deleteDeployment(redis: Redis, id: string, ownerId?: string) {
   const row = await prisma.deployment.delete({ where: { id } }); // build_logs cascade
-  await redis.del(keys.logs(id), keys.logSeq(id), keys.paused(id));
+  await redis.del(keys.logs(id), keys.logSeq(id), keys.paused(id), keys.runtime(id)); // the worker removes the container
   // If that was the app's live build, its URL falls back to the previous live one.
   await refreshAppAlias(redis, row.projectId);
   await publish(redis, { type: 'deployment.deleted', id, ownerId });
+}
+
+/**
+ * Deletes a whole app: every build of the project `id` belongs to, their logs, the app's URL and the project
+ * itself. Builds still in progress are stopped first. Object storage is cleaned by the caller through
+ * `removeFiles` (the API owns the storage client); server containers are removed by the worker when it sees
+ * the `deployment.deleted` events. Returns the deleted build ids, or null if `id` isn't the owner's.
+ */
+export async function deleteApp(
+  redis: Redis,
+  id: string,
+  ownerId: string,
+  removeFiles: (buildId: string) => Promise<unknown>,
+) {
+  const build = await prisma.deployment.findFirst({ where: { id, ownerId }, select: { projectId: true } });
+  if (!build) return null;
+  const project = await prisma.project.findUniqueOrThrow({
+    where: { id: build.projectId },
+    select: { slug: true, deployments: { select: { id: true, status: true } } },
+  });
+
+  // Stop anything still cloning, queued or building, so no worker writes output for a build we delete.
+  for (const d of project.deployments)
+    if (['cloning', 'queued', 'building', 'uploading'].includes(d.status)) await cancelDeployment(redis, d.id);
+
+  const ids = project.deployments.map((d) => d.id);
+  await Promise.all(ids.map((buildId) => removeFiles(buildId)));
+  await prisma.project.delete({ where: { id: build.projectId } }); // deployments and build_logs cascade
+
+  await redis.del(
+    ...ids.flatMap((b) => [keys.logs(b), keys.logSeq(b), keys.paused(b), keys.runtime(b)]),
+    ...(project.slug ? [keys.alias(project.slug)] : []),
+  );
+  for (const buildId of ids) await publish(redis, { type: 'deployment.deleted', id: buildId, ownerId });
+  return ids;
 }
 
 export async function getStats(redis: Redis, ownerId: string): Promise<PlatformStats> {

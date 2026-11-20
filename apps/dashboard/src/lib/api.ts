@@ -61,7 +61,8 @@ export const api = {
   createDeployment: (input: CreateDeploymentInput) =>
     request<Deployment>('/api/deployments', { method: 'POST', body: JSON.stringify(input) }),
   redeploy: (id: string) => request<Deployment>(`/api/deployments/${id}/redeploy`, { method: 'POST' }),
-  deleteDeployment: (id: string) => request<void>(`/api/deployments/${id}`, { method: 'DELETE' }),
+  /** Deletes the whole app the build belongs to; returns the ids of every build removed. */
+  deleteDeployment: (id: string) => request<{ deleted: string[] }>(`/api/deployments/${id}`, { method: 'DELETE' }),
   cancelDeployment: (id: string) => request<Deployment>(`/api/deployments/${id}/cancel`, { method: 'POST' }),
   pauseDeployment: (id: string) => request<Deployment>(`/api/deployments/${id}/pause`, { method: 'POST' }),
   resumeDeployment: (id: string) => request<Deployment>(`/api/deployments/${id}/resume`, { method: 'POST' }),

@@ -26,6 +26,27 @@ export class CancelledError extends Error {
  * (default: untrusted code never touches the host) or as a local process.
  * Output is split into lines and streamed to `onLine` as it arrives.
  */
+/** Docker memory string ("4g", "512m") → MiB, or null if it can't be parsed. */
+function memoryMiB(limit: string) {
+  const m = /^(\d+(?:\.\d+)?)([bkmg]?)$/i.exec(limit.trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  const unit = (m[2] || 'b').toLowerCase();
+  return Math.floor(unit === 'g' ? n * 1024 : unit === 'm' ? n : unit === 'k' ? n / 1024 : n / 1024 / 1024);
+}
+
+/**
+ * Node's default heap cap ignores the container limit: size it to ~75% of the limit so V8 collects garbage
+ * before the kernel kills the process. Returns a NODE_OPTIONS value, or null if the limit can't be parsed.
+ */
+export function heapFlag(memoryLimit: string) {
+  const mib = memoryMiB(memoryLimit);
+  // IPv4 first: like the Kiln images (see Dockerfile), Docker networks are usually IPv4-only, and a failed
+  // IPv6 attempt makes downloads during the build (e.g. next/font fetching Google Fonts) flaky.
+  return mib ? `--max-old-space-size=${Math.max(256, Math.floor(mib * 0.75))} --dns-result-order=ipv4first` : null;
+}
+const buildHeap = heapFlag(config.worker.memory);
+
 export function runCommand(opts: RunOptions): Promise<void> {
   const { cwd, command, name, onLine, timeoutMs, signal } = opts;
   if (signal?.aborted) return Promise.reject(new CancelledError());
@@ -54,6 +75,7 @@ export function runCommand(opts: RunOptions): Promise<void> {
           'npm_config_cache=/tmp/.npm',
           '-e',
           'FORCE_COLOR=1',
+          ...(buildHeap ? ['-e', `NODE_OPTIONS=${buildHeap}`] : []),
           '-v',
           `${cwd}:/app`,
           '-w',
@@ -123,6 +145,14 @@ export function runCommand(opts: RunOptions): Promise<void> {
       if (code === 0) return resolve();
       if (docker && code === 125)
         return reject(new Error('Docker failed to start the build container. Is the Docker daemon running?'));
+      if (code === 137 || exitSignal === 'SIGKILL')
+        return reject(
+          new Error(
+            docker
+              ? `"${command}" ran out of memory and was killed (build limit: ${config.worker.memory}). Raise BUILD_MEMORY to give builds more room.`
+              : `"${command}" was killed by the system, most likely because it ran out of memory.`,
+          ),
+        );
       reject(new Error(`Command "${command}" exited with ${exitSignal ?? `code ${code}`}`));
     });
   });

@@ -20,6 +20,8 @@ export const keys = {
   paused: (id: string) => `deployx:paused:${id}`,
   /** App slug → id of the app's latest live (ready) build; the router resolves app URLs through it. */
   alias: (slug: string) => `deployx:alias:${slug}`,
+  /** Build id → JSON RuntimeInfo, present while that build runs as a server container; the router proxies to it. */
+  runtime: (id: string) => `deployx:runtime:${id}`,
 };
 
 export function createRedis(name: string) {

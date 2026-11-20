@@ -37,7 +37,7 @@ export async function uploadDirectory(
   storage: StorageDriver,
   dir: string,
   prefix: string,
-  opts: { ignore?: (rel: string) => boolean; onProgress?: (p: UploadProgress) => void } = {},
+  opts: { ignore?: (rel: string, isDir: boolean) => boolean; onProgress?: (p: UploadProgress) => void } = {},
 ) {
   const files = await walk(dir, opts.ignore);
   let done = 0;
